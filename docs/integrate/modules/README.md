@@ -1,8 +1,3 @@
----
-sidebar_position: 0
-slug : /modules
----
-
 # Module Summary
 
 Here are some production-grade modules that can be used in Cosmos SDK applications, along with their respective documentation:

@@ -1,6 +1,4 @@
----
-sidebar_position: 1
----
+
 
 # Introduction to Cosmos SDK Modules
 

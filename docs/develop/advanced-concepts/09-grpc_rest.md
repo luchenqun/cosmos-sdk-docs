@@ -1,6 +1,4 @@
----
-sidebar_position: 1
----
+
 
 # gRPC, REST, and CometBFT Endpoints
 
@@ -93,8 +91,8 @@ Some CometBFT RPC endpoints are directly related to the Cosmos SDK:
 
 ## Comparison Table
 
-| Name           | Advantages                                                                                                                                                            | Disadvantages                                                                                                 |
-| -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
-| gRPC           | - can use code-generated stubs in various languages <br /> - supports streaming and bidirectional communication (HTTP2) <br /> - small wire binary sizes, faster transmission | - based on HTTP2, not available in browsers <br /> - learning curve (mostly due to Protobuf)                      |
-| REST           | - ubiquitous <br/> - client libraries in all languages, faster implementation <br />                                                                                        | - only supports unary request-response communication (HTTP1.1) <br/> - bigger over-the-wire message sizes (JSON) |
-| CometBFT RPC | - easy to use                                                                                                                                                         | - bigger over-the-wire message sizes (JSON)                                                                   |
+| Name         | Advantages                                                                                                                                                                    | Disadvantages                                                                                                    |
+| ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| gRPC         | - can use code-generated stubs in various languages <br /> - supports streaming and bidirectional communication (HTTP2) <br /> - small wire binary sizes, faster transmission | - based on HTTP2, not available in browsers <br /> - learning curve (mostly due to Protobuf)                     |
+| REST         | - ubiquitous <br/> - client libraries in all languages, faster implementation <br />                                                                                          | - only supports unary request-response communication (HTTP1.1) <br/> - bigger over-the-wire message sizes (JSON) |
+| CometBFT RPC | - easy to use                                                                                                                                                                 | - bigger over-the-wire message sizes (JSON)                                                                      |

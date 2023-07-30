@@ -1,6 +1,4 @@
----
-sidebar_position: 1
----
+
 
 # `x/mint`
 
@@ -138,7 +136,7 @@ BlockProvision(params Params) sdk.Coin {
 The minting module contains the following parameters:
 
 | Key                 | Type            | Example                |
-|---------------------|-----------------|------------------------|
+| ------------------- | --------------- | ---------------------- |
 | MintDenom           | string          | "uatom"                |
 | InflationRateChange | string (dec)    | "0.130000000000000000" |
 | InflationMax        | string (dec)    | "0.200000000000000000" |
@@ -154,7 +152,7 @@ The minting module emits the following events:
 ### BeginBlocker
 
 | Type | Attribute Key     | Attribute Value    |
-|------|-------------------|--------------------|
+| ---- | ----------------- | ------------------ |
 | mint | bonded_ratio      | {bondedRatio}      |
 | mint | inflation         | {inflation}        |
 | mint | annual_provisions | {annualProvisions} |

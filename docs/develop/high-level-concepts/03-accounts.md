@@ -1,8 +1,3 @@
----
-sidebar_position: 1
-dislayed_sidebar: developSidebar
----
-
 # Accounts
 
 :::note Synopsis
@@ -78,10 +73,10 @@ The Cosmos SDK supports the following digital key schemes for creating digital s
 * `tm-ed25519`, as implemented in the [Cosmos SDK `crypto/keys/ed25519` package](https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/crypto/keys/ed25519/ed25519.go). This scheme is supported only for the consensus validation.
 
 |              | Address length in bytes | Public key length in bytes | Used for transaction authentication | Used for consensus (cometbft) |
-| :----------: | :---------------------: | :------------------------: | :---------------------------------: | :-----------------------------: |
-| `secp256k1`  |           20            |             33             |                 yes                 |               no                |
-| `secp256r1`  |           32            |             33             |                 yes                 |               no                |
-| `tm-ed25519` |     -- not used --      |             32             |                 no                  |               yes               |
+| :----------: | :---------------------: | :------------------------: | :---------------------------------: | :---------------------------: |
+| `secp256k1`  |           20            |             33             |                 yes                 |              no               |
+| `secp256r1`  |           32            |             33             |                 yes                 |              no               |
+| `tm-ed25519` |     -- not used --      |             32             |                 no                  |              yes              |
 
 ## Addresses
 

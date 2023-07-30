@@ -1,6 +1,4 @@
----
-sidebar_position: 1
----
+
 
 # `x/staking`
 
@@ -908,15 +906,15 @@ The staking module emits the following events:
 
 ### MsgCancelUnbondingDelegation
 
-| Type                          | Attribute Key       | Attribute Value                     |
-| ----------------------------- | ------------------  | ------------------------------------|
-| cancel_unbonding_delegation   | validator           | {validatorAddress}                  |
-| cancel_unbonding_delegation   | delegator           | {delegatorAddress}                  |
-| cancel_unbonding_delegation   | amount              | {cancelUnbondingDelegationAmount}   |
-| cancel_unbonding_delegation   | creation_height     | {unbondingCreationHeight}           |
-| message                       | module              | staking                             |
-| message                       | action              | cancel_unbond                       |
-| message                       | sender              | {senderAddress}                     |
+| Type                        | Attribute Key   | Attribute Value                   |
+| --------------------------- | --------------- | --------------------------------- |
+| cancel_unbonding_delegation | validator       | {validatorAddress}                |
+| cancel_unbonding_delegation | delegator       | {delegatorAddress}                |
+| cancel_unbonding_delegation | amount          | {cancelUnbondingDelegationAmount} |
+| cancel_unbonding_delegation | creation_height | {unbondingCreationHeight}         |
+| message                     | module          | staking                           |
+| message                     | action          | cancel_unbond                     |
+| message                     | sender          | {senderAddress}                   |
 
 ### MsgBeginRedelegate
 
@@ -937,7 +935,7 @@ The staking module emits the following events:
 The staking module contains the following parameters:
 
 | Key               | Type             | Example                |
-|-------------------|------------------|------------------------|
+| ----------------- | ---------------- | ---------------------- |
 | UnbondingTime     | string (time ns) | "259200000000000"      |
 | MaxValidators     | uint16           | 100                    |
 | KeyMaxEntries     | uint16           | 7                      |

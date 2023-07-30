@@ -1,6 +1,4 @@
----
-sidebar_position: 1
----
+
 
 # Inter-block Cache
 
@@ -115,9 +113,9 @@ To enable inter-block cache on `rootmulti`, one needs to instantiate a `CommitKV
 
 The method `NewCommitKVStoreCacheManager` creates a new cache manager and returns it.
 
-| Name  | Type | Description |
-| ------------- | ---------|------- |
-| size  | integer | Determines the capacity of each of the KVCache maintained by the manager |
+| Name | Type    | Description                                                              |
+| ---- | ------- | ------------------------------------------------------------------------ |
+| size | integer | Determines the capacity of each of the KVCache maintained by the manager |
 
 ```go
 func NewCommitKVStoreCacheManager(size uint) CommitKVStoreCacheManager {
@@ -128,11 +126,11 @@ func NewCommitKVStoreCacheManager(size uint) CommitKVStoreCacheManager {
 
 `GetStoreCache` returns a cache from the CommitStoreCacheManager for a given store key. If no cache exists for the store key, then one is created and set.
 
-| Name  | Type | Description |
-| ------------- | ---------|------- |
-| manager  | `CommitKVStoreCacheManager` | The cache manager |
-| storeKey  | string | The store key of the store being retrieved |
-| store  | `CommitKVStore` | The store that it is cached in case the manager does not have any in its map of caches |
+| Name     | Type                        | Description                                                                            |
+| -------- | --------------------------- | -------------------------------------------------------------------------------------- |
+| manager  | `CommitKVStoreCacheManager` | The cache manager                                                                      |
+| storeKey | string                      | The store key of the store being retrieved                                             |
+| store    | `CommitKVStore`             | The store that it is cached in case the manager does not have any in its map of caches |
 
 ```go
 func GetStoreCache(
@@ -152,10 +150,10 @@ func GetStoreCache(
 
 `Unwrap` returns the underlying CommitKVStore for a given store key.
 
-| Name  | Type | Description |
-| ------------- | ---------|------- |
-| manager  | `CommitKVStoreCacheManager` | The cache manager |
-| storeKey  | string | The store key of the store being unwrapped |
+| Name     | Type                        | Description                                |
+| -------- | --------------------------- | ------------------------------------------ |
+| manager  | `CommitKVStoreCacheManager` | The cache manager                          |
+| storeKey | string                      | The store key of the store being unwrapped |
 
 ```go
 func Unwrap(
@@ -173,9 +171,9 @@ func Unwrap(
 
 `Reset` resets the manager's map of caches.
 
-| Name  | Type | Description |
-| ------------- | ---------|------- |
-| manager  | `CommitKVStoreCacheManager` | The cache manager |
+| Name    | Type                        | Description       |
+| ------- | --------------------------- | ----------------- |
+| manager | `CommitKVStoreCacheManager` | The cache manager |
 
 ```go
 function Reset(manager CommitKVStoreCacheManager) {
@@ -190,10 +188,10 @@ function Reset(manager CommitKVStoreCacheManager) {
 
 `NewCommitKVStoreCache` creates a new `CommitKVStoreCache` and returns it.
 
-| Name  | Type | Description |
-| ------------- | ---------|------- |
-| store  | CommitKVStore | The store to be cached |
-| size  | string | Determines the capacity of the cache being created |
+| Name  | Type          | Description                                        |
+| ----- | ------------- | -------------------------------------------------- |
+| store | CommitKVStore | The store to be cached                             |
+| size  | string        | Determines the capacity of the cache being created |
 
 ```go
 func NewCommitKVStoreCache(
@@ -206,10 +204,10 @@ func NewCommitKVStoreCache(
 
 `Get` retrieves a value by key. It first looks in the cache. If the key is not in the cache, the query is delegated to the underlying `CommitKVStore`. In the latter case, the key/value pair is cached. The method returns the value.
 
-| Name  | Type | Description |
-| ------------- | ---------|------- |
-| KVCache  | `CommitKVStoreCache` | The `CommitKVStoreCache` from which the key/value pair is retrieved  |
-| key  | string | Key of the key/value pair being retrieved |
+| Name    | Type                 | Description                                                         |
+| ------- | -------------------- | ------------------------------------------------------------------- |
+| KVCache | `CommitKVStoreCache` | The `CommitKVStoreCache` from which the key/value pair is retrieved |
+| key     | string               | Key of the key/value pair being retrieved                           |
 
 ```go
 func Get(
@@ -230,11 +228,11 @@ func Get(
 
 `Set` inserts a key/value pair into both the write-through cache and the underlying `CommitKVStore`.
 
-| Name  | Type | Description |
-| ------------- | ---------|------- |
-| KVCache  | `CommitKVStoreCache` | The `CommitKVStoreCache` to which the key/value pair is inserted |
-| key  | string | Key of the key/value pair being inserted |
-| value  | []byte | Value of the key/value pair being inserted |
+| Name    | Type                 | Description                                                      |
+| ------- | -------------------- | ---------------------------------------------------------------- |
+| KVCache | `CommitKVStoreCache` | The `CommitKVStoreCache` to which the key/value pair is inserted |
+| key     | string               | Key of the key/value pair being inserted                         |
+| value   | []byte               | Value of the key/value pair being inserted                       |
 
 ```go
 func Set(
@@ -249,10 +247,10 @@ func Set(
 
 `Delete` removes a key/value pair from both the write-through cache and the underlying `CommitKVStore`.
 
-| Name  | Type | Description |
-| ------------- | ---------|------- |
-| KVCache  | `CommitKVStoreCache` | The `CommitKVStoreCache` from which the key/value pair is deleted |
-| key  | string | Key of the key/value pair being deleted |
+| Name    | Type                 | Description                                                       |
+| ------- | -------------------- | ----------------------------------------------------------------- |
+| KVCache | `CommitKVStoreCache` | The `CommitKVStoreCache` from which the key/value pair is deleted |
+| key     | string               | Key of the key/value pair being deleted                           |
 
 ```go
 func Delete(
@@ -268,9 +266,9 @@ func Delete(
 
 > It is unclear whether there is a use case for `CacheWrap`. 
 
-| Name  | Type | Description |
-| ------------- | ---------|------- |
-| KVCache  | `CommitKVStoreCache` | The `CommitKVStoreCache` being wrapped |
+| Name    | Type                 | Description                            |
+| ------- | -------------------- | -------------------------------------- |
+| KVCache | `CommitKVStoreCache` | The `CommitKVStoreCache` being wrapped |
 
 ```go
 func CacheWrap(

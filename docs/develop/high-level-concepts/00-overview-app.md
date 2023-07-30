@@ -1,8 +1,3 @@
----
-sidebar_position: 1
-dislayed_sidebar: developSidebar
----
-
 # Overview of a  Cosmos SDK Application
 
 :::note Synopsis

@@ -1,6 +1,4 @@
----
-sidebar_position: 1
----
+
 
 # Telemetry
 
@@ -80,7 +78,7 @@ The following examples expose too much cardinality and may not even prove to be 
 ## Supported Metrics
 
 | Metric                          | Description                                                                               | Unit            | Type    |
-|:--------------------------------|:------------------------------------------------------------------------------------------|:----------------|:--------|
+| :------------------------------ | :---------------------------------------------------------------------------------------- | :-------------- | :------ |
 | `tx_count`                      | Total number of txs processed via `DeliverTx`                                             | tx              | counter |
 | `tx_successful`                 | Total number of successful txs processed via `DeliverTx`                                  | tx              | counter |
 | `tx_failed`                     | Total number of failed txs processed via `DeliverTx`                                      | tx              | counter |

@@ -1,6 +1,4 @@
----
-sidebar_position: 1
----
+
 # Events
 
 :::note Synopsis
@@ -54,12 +52,12 @@ Lastly, Events are returned to the underlying consensus engine in the response o
 
 The following examples show how to query Events using the Cosmos SDK.
 
-| Event                                            | Description                                                                                                                                              |
-| ------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `tx.height=23`                                   | Query all transactions at height 23                                                                                                                      |
-| `message.action='/cosmos.bank.v1beta1.Msg/Send'` | Query all transactions containing a x/bank `Send` [Service `Msg`](../../integrate/building-modules/03-msg-services.md). Note the `'`s around the value.                  |
-| `message.module='bank'`                          | Query all transactions containing messages from the x/bank module. Note the `'`s around the value.                                                       |
-| `create_validator.validator='cosmosval1...'`     | x/staking-specific Event, see [x/staking SPEC](../../integrate/modules/staking/README.md).                                                         |
+| Event                                            | Description                                                                                                                                             |
+| ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `tx.height=23`                                   | Query all transactions at height 23                                                                                                                     |
+| `message.action='/cosmos.bank.v1beta1.Msg/Send'` | Query all transactions containing a x/bank `Send` [Service `Msg`](../../integrate/building-modules/03-msg-services.md). Note the `'`s around the value. |
+| `message.module='bank'`                          | Query all transactions containing messages from the x/bank module. Note the `'`s around the value.                                                      |
+| `create_validator.validator='cosmosval1...'`     | x/staking-specific Event, see [x/staking SPEC](../../integrate/modules/staking/README.md).                                                              |
 
 ## EventManager
 

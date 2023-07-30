@@ -1,7 +1,3 @@
----
-sidebar_position: 1
-dislayed_sidebar: integrateSidebar
----
 
 # Application upgrade
 
@@ -26,7 +22,7 @@ Before the application binary is upgraded, Cosmovisor calls a `pre-upgrade` comm
 The `pre-upgrade` command does not take in any command-line arguments and is expected to terminate with the following exit codes:
 
 | Exit status code | How it is handled in Cosmosvisor                                                                                    |
-|------------------|---------------------------------------------------------------------------------------------------------------------|
+| ---------------- | ------------------------------------------------------------------------------------------------------------------- |
 | `0`              | Assumes `pre-upgrade` command executed successfully and continues the upgrade.                                      |
 | `1`              | Default exit code when `pre-upgrade` command has not been implemented.                                              |
 | `30`             | `pre-upgrade` command was executed but failed. This fails the entire upgrade.                                       |

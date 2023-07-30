@@ -1,6 +1,4 @@
----
-sidebar_position: 1
----
+
 
 # `x/crisis`
 
@@ -67,7 +65,7 @@ The crisis module emits the following events:
 #### MsgVerifyInvariance
 
 | Type      | Attribute Key | Attribute Value  |
-|-----------|---------------|------------------|
+| --------- | ------------- | ---------------- |
 | invariant | route         | {invariantRoute} |
 | message   | module        | crisis           |
 | message   | action        | verify_invariant |
@@ -78,7 +76,7 @@ The crisis module emits the following events:
 The crisis module contains the following parameters:
 
 | Key         | Type          | Example                           |
-|-------------|---------------|-----------------------------------|
+| ----------- | ------------- | --------------------------------- |
 | ConstantFee | object (coin) | {"denom":"uatom","amount":"1000"} |
 
 ## Client

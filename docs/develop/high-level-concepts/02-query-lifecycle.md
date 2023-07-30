@@ -1,8 +1,3 @@
----
-sidebar_position: 1
-dislayed_sidebar: developSidebar
----
-
 # Query Lifecycle
 
 :::note Synopsis
