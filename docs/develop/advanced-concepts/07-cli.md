@@ -1,3 +1,196 @@
+# 命令行界面
+
+:::note 概述
+本文档描述了命令行界面（CLI）在高层次上的工作原理，适用于[**应用程序**](../high-level-concepts/00-overview-app.md)。有关为 Cosmos SDK [**模块**](../../integrate/building-modules/00-intro.md) 实现 CLI 的详细信息，请参阅[此处](../../integrate/building-modules/09-module-interfaces.md#cli)。
+:::
+
+## 命令行界面
+
+### 示例命令
+
+创建 CLI 没有固定的方式，但是 Cosmos SDK 模块通常使用 [Cobra 库](https://github.com/spf13/cobra)。使用 Cobra 构建 CLI 需要定义命令、参数和标志。[**命令**](#root-command) 用于理解用户希望执行的操作，例如 `tx` 用于创建交易，`query` 用于查询应用程序。每个命令还可以有嵌套的子命令，用于命名特定的交易类型。用户还可以提供**参数**，例如要发送代币的帐户号码，以及[**标志**](#flags)来修改命令的各个方面，例如燃料价格或广播到哪个节点。
+
+以下是用户可能输入的与 simapp CLI `simd` 交互以发送一些代币的命令示例：
+
+```bash
+simd tx bank send $MY_VALIDATOR_ADDRESS $RECIPIENT 1000stake --gas auto --gas-prices <gasPrices>
+```
+
+前四个字符串指定了命令：
+
+* 整个应用程序的根命令 `simd`。
+* 子命令 `tx`，其中包含允许用户创建交易的所有命令。
+* 子命令 `bank`，用于指示将命令路由到哪个模块（在本例中为 [`x/bank`](../../integrate/modules/bank/README.md) 模块）。
+* 交易类型 `send`。
+
+接下来的两个字符串是参数：用户希望从中发送的 `from_address`，以及接收方的 `to_address` 和他们希望发送的 `amount`。最后，命令的最后几个字符串是可选的标志，用于指示用户愿意支付多少费用（使用执行交易所使用的燃料量和用户提供的燃料价格来计算）。
+
+CLI与[node](03-node.md)进行交互以处理此命令。接口本身在`main.go`文件中定义。
+
+### 构建CLI
+
+`main.go`文件需要有一个`main()`函数，该函数创建一个根命令，所有应用程序命令将作为子命令添加到其中。根命令还处理以下内容：
+
+* **设置配置**，通过读取配置文件（例如Cosmos SDK配置文件）。
+* **添加任何标志**，例如`--chain-id`。
+* **通过调用应用程序的`MakeCodec()`函数（在`simapp`中称为`MakeTestEncodingConfig`）来实例化`codec`**。[`codec`](06-encoding.md)用于对应用程序的数据结构进行编码和解码 - 存储只能持久化`[]byte`，因此开发人员必须为其数据结构定义序列化格式或使用默认的Protobuf。
+* **为所有可能的用户交互添加子命令**，包括[事务命令](#transaction-commands)和[查询命令](#query-commands)。
+
+`main()`函数最后创建一个执行器并[执行](https://pkg.go.dev/github.com/spf13/cobra#Command.Execute)根命令。以下是`simapp`应用程序中`main()`函数的示例：
+
+```go reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/simapp/simd/main.go#L12-L24
+```
+
+文档的其余部分将详细说明每个步骤需要实现的内容，并包括来自`simapp` CLI文件的较小代码片段。
+
+## 向CLI添加命令
+
+每个应用程序CLI首先构建一个根命令，然后使用`rootCmd.AddCommand()`聚合子命令（通常还有进一步嵌套的子命令）来添加功能。应用程序的大部分独特功能都在其事务和查询命令中，分别称为`TxCmd`和`QueryCmd`。
+
+### 根命令
+
+根命令（称为`rootCmd`）是用户在命令行中首次输入的命令，用于指示他们希望与哪个应用程序进行交互。用于调用命令的字符串（"Use"字段）通常是应用程序名称后缀为`-d`，例如`simd`或`gaiad`。根命令通常包括以下命令以支持应用程序的基本功能。
+
+* **Status** 命令来自 Cosmos SDK rpc 客户端工具，用于打印有关连接的 [`Node`](03-node.md) 状态的信息。节点的状态包括 `NodeInfo`、`SyncInfo` 和 `ValidatorInfo`。
+* **Keys** [命令](https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/client/keys) 来自 Cosmos SDK 客户端工具，包括一系列子命令，用于使用 Cosmos SDK 加密工具中的密钥功能，包括添加新密钥并将其保存到密钥环中，列出密钥环中存储的所有公钥，以及删除密钥。例如，用户可以输入 `simd keys add <name>` 来添加新密钥并将加密副本保存到密钥环中，使用 `--recover` 标志从种子短语中恢复私钥，或使用 `--multisig` 标志将多个密钥组合在一起创建多签名密钥。有关 `add` 密钥命令的详细信息，请参阅[此处](https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/client/keys/add.go)的代码。有关使用 `--keyring-backend` 存储密钥凭据的更多详细信息，请查看[keyring 文档](../../user/run-node/00-keyring.md)。
+* **Server** 命令来自 Cosmos SDK 服务器包。这些命令负责提供启动 ABCI CometBFT 应用所需的机制，并提供完全引导应用所需的 CLI 框架（基于 [cobra](https://github.com/spf13/cobra)）。该包公开了两个核心函数：`StartCmd` 和 `ExportCmd`，分别用于创建启动应用程序和导出状态的命令。
+了解更多信息，请点击[此处](https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/server)。
+* [**Transaction**](#transaction-commands) 命令。
+* [**Query**](#query-commands) 命令。
+
+下面是 `simapp` 应用程序中的一个示例 `rootCmd` 函数。它实例化根命令，添加一个[*persistent* flag](#flags) 和 `PreRun` 函数，在每次执行之前运行，并添加所有必要的子命令。
+
+```go reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/simapp/simd/cmd/root.go#L38-L92
+```
+
+`rootCmd`有一个名为`initAppConfig()`的函数，用于设置应用程序的自定义配置。
+默认情况下，应用程序使用来自Cosmos SDK的CometBFT应用程序配置模板，可以通过`initAppConfig()`进行覆盖。
+以下是一个示例代码，用于覆盖默认的`app.toml`模板。
+
+```go reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/simapp/simd/cmd/root.go#L106-L161
+```
+
+`initAppConfig()`还允许覆盖默认的Cosmos SDK [服务器配置](https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/server/config/config.go#L235)。一个示例是`min-gas-prices`配置，它定义了验证人愿意接受的处理交易的最低燃料价格。默认情况下，Cosmos SDK将此参数设置为`""`（空字符串），这会强制所有验证人调整自己的`app.toml`并设置一个非空值，否则节点将在启动时停止。这对于验证人来说可能不是最好的用户体验，因此链开发人员可以在`initAppConfig()`函数中为验证人设置一个默认的`app.toml`值。
+
+```go reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/simapp/simd/cmd/root.go#L126-L142
+```
+
+根级别的`status`和`keys`子命令在大多数应用程序中都是常见的，并且不与应用程序状态交互。应用程序的大部分功能 - 用户实际上可以通过它来*执行*的功能 - 是通过其`tx`和`query`命令启用的。
+
+### 交易命令
+
+[交易](01-transactions.md)是包装触发状态更改的[`Msg`](../../integrate/building-modules/02-messages-and-queries.md#messages)的对象。为了使用CLI界面创建交易，通常会将`txCommand`函数添加到`rootCmd`中：
+
+```go reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/simapp/simd/cmd/root.go#L177-L184
+```
+
+这个`txCommand`函数添加了所有可用于应用程序终端用户的交易。通常包括：
+
+* 来自[`auth`](../../integrate/modules/auth/README.md)模块的**签名命令**，用于对交易中的消息进行签名。要启用多重签名，请添加`auth`模块的`MultiSign`命令。由于每个交易都需要某种形式的签名才能有效，因此签名命令对于每个应用程序都是必需的。
+* 来自Cosmos SDK客户端工具的**广播命令**，用于广播交易。
+* 应用程序所依赖的**所有[模块交易命令](../../integrate/building-modules/09-module-interfaces.md#transaction-commands)**，通过使用[基本模块管理器](../../integrate/building-modules/01-module-manager.md#basic-manager)的`AddTxCommands()`函数来获取。
+
+这是一个将这些子命令从`simapp`应用程序聚合到`txCommand`的示例：
+
+```go reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/simapp/simd/cmd/root.go#L227-L251
+```
+
+### 查询命令
+
+[**查询**](../../integrate/building-modules/02-messages-and-queries.md#queries)是允许用户检索应用程序状态信息的对象。为了使用CLI界面创建查询，通常会将一个名为`queryCommand`的函数添加到`rootCmd`中：
+
+```go reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/simapp/simd/cmd/root.go#L177-L184
+```
+
+这个`queryCommand`函数会添加所有可供终端用户使用的查询。通常包括：
+
+* **QueryTx** 和/或其他来自`auth`模块的事务查询命令，允许用户通过输入事务哈希、标签列表或块高度来搜索事务。这些查询允许用户查看事务是否已包含在块中。
+* **Account命令** 来自`auth`模块，根据地址显示账户状态（例如账户余额）。
+* 来自Cosmos SDK rpc客户端工具的**Validator命令**，显示给定高度的验证器集。
+* 来自Cosmos SDK RPC客户端工具的**Block命令**，显示给定高度的块数据。
+* 使用[basic module manager](../../integrate/building-modules/01-module-manager.md#basic-manager)的`AddQueryCommands()`函数检索应用程序所依赖的**所有[模块查询命令](../../integrate/building-modules/09-module-interfaces.md#query-commands)**。
+
+这是一个将这些子命令从`simapp`应用程序聚合到`queryCommand`的示例：
+
+```go reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/simapp/simd/cmd/root.go#L204-L225
+```
+
+## 标志
+
+标志用于修改命令；开发人员可以在`flags.go`文件中与CLI一起包含它们。用户可以在命令中明确包含它们，或者在其[`app.toml`](../../user/run-node/02-interact-node.md#configuring-the-node-using-apptoml)中预先配置它们。常见的预配置标志包括连接到的`--node`和用户希望与之交互的区块链的`--chain-id`。
+
+一个*持久性*标志（与*本地*标志相对）添加到一个命令中，会传递给其所有子命令：子命令将继承这些标志的配置值。此外，当标志被添加到命令时，它们都有默认值；有些标志将选项关闭，而其他标志则是空值，用户需要覆盖它们以创建有效的命令。标志可以明确标记为*必需*，这样如果用户没有提供值，就会自动抛出错误，但也可以以不同的方式处理意外缺失的标志。
+
+标志直接添加到命令中（通常在[模块的 CLI 文件](../../integrate/building-modules/09-module-interfaces.md#flags)中定义模块命令的地方），除了`rootCmd`持久性标志外，不需要在应用程序级别添加任何标志。通常在根命令中为`--chain-id`添加一个*持久性*标志，它是应用程序所属的区块链的唯一标识符。可以在`main()`函数中添加此标志。添加此标志是有意义的，因为在此应用程序 CLI 中，命令之间的链 ID 不应该更改。
+
+## 环境变量
+
+每个标志都绑定到相应的命名环境变量。环境变量的名称由两部分组成 - 大写的`basename`后跟标志的名称。`-`必须替换为`_`。例如，应用程序的基本名称为`GAIA`，则标志`--home`绑定到`GAIA_HOME`。这样可以减少输入常规操作所需的标志数量。例如，不需要输入：
+
+```shell
+gaia --home=./ --node=<node address> --chain-id="testchain-1" --keyring-backend=test tx ... --from=<key name>
+```
+
+而可以更方便地输入：
+
+```shell
+# define env variables in .env, .envrc etc
+GAIA_HOME=<path to home>
+GAIA_NODE=<node address>
+GAIA_CHAIN_ID="testchain-1"
+GAIA_KEYRING_BACKEND="test"
+
+# and later just use
+gaia tx ... --from=<key name>
+```
+
+## 配置
+
+应用程序的根命令使用`PersistentPreRun()` cobra 命令属性来执行命令非常重要，这样所有子命令都可以访问服务器和客户端上下文。这些上下文最初被设置为它们的默认值，并且可以在各自的`PersistentPreRun()`函数中进行修改，作用范围限定在命令内部。请注意，`client.Context`通常预先填充了可能对所有命令有用的“默认”值，如果需要，可以继承并覆盖这些值。
+
+这是`simapp`中`PersistentPreRun()`函数的示例：
+
+```go reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/simapp/simd/cmd/root.go#L63-L86
+```
+
+`SetCmdClientContextHandler`调用通过`ReadPersistentCommandFlags`读取持久化标志，创建一个`client.Context`并将其设置在根命令的`Context`上。
+
+`InterceptConfigsPreRunHandler`调用创建一个viper字面量，默认`server.Context`和一个日志记录器，并将其设置在根命令的`Context`上。`server.Context`将被修改并保存到磁盘上。内部的`interceptConfigs`调用根据提供的主目录路径读取或创建一个CometBFT配置。此外，`interceptConfigs`还读取和加载应用程序配置`app.toml`，并将其绑定到`server.Context`的viper字面量上。这对于应用程序不仅可以访问CLI标志，还可以访问此文件提供的应用程序配置值至关重要。
+
+:::tip
+当希望配置使用哪个日志记录器时，请不要使用`InterceptConfigsPreRunHandler`，该函数设置默认的SDK日志记录器，而是使用`InterceptConfigsAndCreateContext`并手动设置服务器上下文和日志记录器：
+
+```diff
+-return server.InterceptConfigsPreRunHandler(cmd, customAppTemplate, customAppConfig, customCMTConfig)
+
++serverCtx, err := server.InterceptConfigsAndCreateContext(cmd, customAppTemplate, customAppConfig, customCMTConfig)
++if err != nil {
++	return err
++}
+
++// overwrite default server logger
++logger, err := server.CreateSDKLogger(serverCtx, cmd.OutOrStdout())
++if err != nil {
++	return err
++}
++serverCtx.Logger = logger.With(log.ModuleKey, "server")
+
++// set server context
++return server.SetCmdServerContext(cmd, serverCtx)
+```
+
+:::
+
+
 
 
 # Command-Line Interface

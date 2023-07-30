@@ -1,3 +1,192 @@
+# 交易生命周期
+
+:::note 概要
+本文档描述了从创建到提交状态更改的交易生命周期。交易定义在[不同的文档](../advanced-concepts/01-transactions.md)中进行了描述。交易被称为 `Tx`。
+:::
+
+:::note
+
+### 先决条件阅读
+
+* [Cosmos SDK 应用程序解剖](00-overview-app.md)
+:::
+
+## 创建
+
+### 交易创建
+
+其中一个主要的应用程序接口是命令行界面。用户可以通过在[命令行界面](../advanced-concepts/07-cli.md)中以以下格式输入命令来创建交易 `Tx`，提供交易类型 `[command]`、参数 `[args]` 和配置项（例如 gas 价格）`[flags]`：
+
+```bash
+[appname] tx [command] [args] [flags]
+```
+
+该命令会自动**创建**交易，使用账户的私钥**签名**交易，并将其**广播**到指定的对等节点。
+
+交易创建需要一些必需的和可选的标志。`--from` 标志指定了交易的发起账户。例如，如果交易正在发送代币，资金将从指定的 `from` 地址中提取。
+
+#### Gas 和费用
+
+此外，用户可以使用几个[标志](../advanced-concepts/07-cli.md)来指示他们愿意支付多少[费用](04-gas-fees.md)：
+
+* `--gas` 指的是交易 `Tx` 消耗的[计算资源](04-gas-fees.md)（称为 gas）的数量。Gas 取决于交易，并且在执行之前无法精确计算，但可以通过将 `--gas` 的值设置为 `auto` 来进行估算。
+* `--gas-adjustment`（可选）可用于将 `gas` 值放大，以避免低估。例如，用户可以将其 gas 调整设置为 1.5，以使用估计 gas 的 1.5 倍。
+* `--gas-prices` 指定用户愿意为每单位 gas 支付多少费用，可以是一个或多个代币的面额。例如，`--gas-prices=0.025uatom, 0.025upho` 表示用户愿意为每单位 gas 支付 0.025uatom 和 0.025upho。
+* `--fees` 指定用户愿意总共支付的费用金额。
+* `--timeout-height` 指定一个块超时高度，以防止交易在超过某个高度后被提交。
+
+支付的手续费的最终价值等于燃料乘以燃料价格。换句话说，`fees = ceil(gas * gasPrices)`。因此，由于手续费可以使用燃料价格计算，反之亦然，用户只需指定其中之一。
+
+随后，验证人通过将给定或计算得到的`gas-prices`与其本地的`min-gas-prices`进行比较，决定是否将交易包含在他们的区块中。如果交易的`gas-prices`不够高，则交易将被拒绝，因此用户有动力支付更多的费用。
+
+#### CLI 示例
+
+应用程序`app`的用户可以在其命令行界面中输入以下命令来生成一笔交易，将1000uatom从`senderAddress`发送到`recipientAddress`。该命令指定了他们愿意支付的燃料数量：自动估算的数量乘以1.5倍，燃料价格为0.025uatom每单位燃料。
+
+```bash
+appd tx send <recipientAddress> 1000uatom --from <senderAddress> --gas auto --gas-adjustment 1.5 --gas-prices 0.025uatom
+```
+
+#### 其他交易创建方法
+
+命令行是与应用程序交互的一种简单方式，但是`Tx`也可以使用[gRPC或REST接口](../advanced-concepts/09-grpc_rest.md)或应用程序开发人员定义的其他入口点来创建。从用户的角度来看，交互取决于他们使用的Web界面或钱包（例如，使用[Lunie.io](https://lunie.io/#/)创建`Tx`并使用Ledger Nano S签名）。
+
+## 添加到内存池
+
+每个接收到`Tx`的全节点（运行CometBFT）都会向应用层发送一个[ABCI消息](https://docs.cometbft.com/v0.37/spec/p2p/messages/)，`CheckTx`，以检查其有效性，并接收到一个`abci.ResponseCheckTx`。如果`Tx`通过了检查，它将被保存在节点的[**内存池**](https://docs.cometbft.com/v0.37/spec/p2p/messages/mempool/)中，这是每个节点独有的一个内存中的交易池，等待被包含在一个区块中 - 诚实的节点会丢弃无效的`Tx`。在共识之前，节点会不断检查传入的交易并将其传播给其对等节点。
+
+### 检查类型
+
+全节点在 `CheckTx` 过程中对 `Tx` 执行无状态（stateless）和有状态（stateful）的检查，目的是尽早识别和拒绝无效的交易，以避免浪费计算资源。
+
+**_无状态_** 检查不需要节点访问状态 - 轻客户端或离线节点可以执行这些检查 - 因此计算开销较小。无状态检查包括确保地址不为空、强制非负数以及其他在定义中指定的逻辑。
+
+**_有状态_** 检查基于已提交的状态验证交易和消息。例如，检查相关值是否存在且可以进行交易、地址是否有足够的资金以及发送者是否被授权或具有正确的所有权以进行交易。在任何给定时刻，全节点通常对应用程序的内部状态有[多个版本](../advanced-concepts/00-baseapp.md#state-updates)，用于不同的目的。例如，节点在验证交易的过程中执行状态更改，但仍需要最后一个已提交状态的副本来回答查询 - 它们不应该使用具有未提交更改的状态来响应。
+
+为了验证 `Tx`，全节点调用 `CheckTx`，其中包括无状态和有状态的检查。进一步的验证将在 [`DeliverTx`](#delivertx) 阶段进行。`CheckTx` 经过几个步骤，首先是对 `Tx` 进行解码。
+
+### 解码
+
+当应用程序从底层共识引擎（例如 CometBFT）接收到 `Tx` 时，它仍然处于其[编码](../advanced-concepts/06-encoding.md)的 `[]byte` 形式，并且需要进行解组才能进行处理。然后，调用 [`runTx`](../advanced-concepts/00-baseapp.md#runtx-antehandler-runmsgs-posthandler) 函数以 `runTxModeCheck` 模式运行，这意味着该函数运行所有检查，但在执行消息和写入状态更改之前退出。
+
+### ValidateBasic（已弃用）
+
+从交易（`Tx`）中提取出消息（[`sdk.Msg`](../advanced-concepts/01-transactions.md#messages)）。对于每个交易，模块开发人员实现的 `sdk.Msg` 接口的 `ValidateBasic` 方法都会运行。
+为了丢弃明显无效的消息，`BaseApp` 类型在处理消息的 [`CheckTx`](../advanced-concepts/00-baseapp.md#checktx) 和 [`DeliverTx`](../advanced-concepts/00-baseapp.md#delivertx) 事务时非常早地调用 `ValidateBasic` 方法。
+`ValidateBasic` 只能包含**无状态**检查（不需要访问状态的检查）。
+
+:::warning
+`ValidateBasic`方法已被弃用，建议直接在各自的[`Msg`服务](../../integrate/building-modules/03-msg-services.md#Validation)中验证消息。
+
+详细信息请阅读[RFC 001](https://docs.cosmos.network/main/rfc/rfc-001-tx-validation)。
+:::
+
+:::note
+`BaseApp`仍然调用实现该方法的消息的`ValidateBasic`以保持向后兼容性。
+:::
+
+#### 指南
+
+不再使用`ValidateBasic`。在模块的`Msg`服务中处理消息时，应进行消息验证。
+
+### AnteHandler
+
+尽管可选，但`AnteHandler`在实践中经常用于执行签名验证、计算燃气、扣除费用和其他与区块链交易相关的核心操作。
+
+`AnteHandler`接收缓存上下文的副本，并对事务类型指定的有限检查进行验证。使用副本允许`AnteHandler`对`Tx`进行有状态的检查，而不会修改最后提交的状态，并在执行失败时恢复到原始状态。
+
+例如，[`auth`](https://github.com/cosmos/cosmos-sdk/tree/main/x/auth/spec)模块的`AnteHandler`检查和递增序列号，检查签名和账户号码，并从事务的第一个签名者中扣除费用 - 所有状态更改都使用`checkState`进行。
+
+### Gas
+
+初始化[`Context`](../advanced-concepts/02-context.md)，其中包含跟踪`Tx`执行期间使用的燃气量的`GasMeter`。用户提供的`Tx`的燃气量称为`GasWanted`。如果执行期间消耗的燃气量`GasConsumed`超过了`GasWanted`，则执行停止，并且对缓存的状态所做的更改不会提交。否则，`CheckTx`将`GasUsed`设置为`GasConsumed`并在结果中返回。计算燃气和费用值后，验证节点检查用户指定的`gas-prices`是否大于其本地定义的`min-gas-prices`。
+
+### 丢弃或添加到内存池
+
+如果在 `CheckTx` 过程中的任何时候 `Tx` 失败，它将被丢弃，事务的生命周期也就此结束。否则，如果它成功通过 `CheckTx`，默认的协议是将其转发到对等节点并将其添加到内存池中，以便 `Tx` 成为下一个区块中包含的候选事务。
+
+**内存池** 的作用是跟踪所有全节点看到的事务。全节点保留一个**内存池缓存**，其中包含它们最近看到的 `mempool.cache_size` 个事务，作为防止重放攻击的第一道防线。理想情况下，`mempool.cache_size` 足够大，能够包含完整的内存池中的所有事务。如果内存池缓存太小无法跟踪所有事务，`CheckTx` 负责识别和拒绝重放的事务。
+
+目前已存在的预防措施包括费用和 `sequence`（nonce）计数器，用于区分重放的事务和相同但有效的事务。如果攻击者试图用多个副本的 `Tx` 垃圾邮件节点，保留内存池缓存的全节点将拒绝所有相同的副本，而不是对它们运行 `CheckTx`。即使副本的 `sequence` 数字已经递增，攻击者也因为需要支付费用而没有动力。
+
+验证节点像全节点一样保留内存池以防止重放攻击，但也将其用作准备包含在区块中的未确认事务的池。请注意，即使在此阶段通过了所有检查，事务仍然有可能在后面被发现无效，因为 `CheckTx` 并未完全验证事务（即，它并未实际执行消息）。
+
+## 区块中的包含
+
+共识是验证节点就接受哪些事务达成一致的过程，它发生在**轮次**中。每个轮次以提议者创建最新事务的区块开始，并以**验证节点**结束，验证节点是具有投票权的特殊全节点，负责共识，同意接受该区块或选择一个 `nil` 区块。验证节点执行共识算法，例如 [CometBFT](https://docs.cometbft.com/v0.37/spec/consensus/)，使用 ABCI 请求向应用程序确认事务，以达成此共识。
+
+共识的第一步是**区块提案**。共识算法从验证者中选择一个提案者来创建和提出一个区块 - 为了将`Tx`包含在内，它必须在这个提案者的内存池中。
+
+## 状态变化
+
+共识的下一步是执行交易以进行完全验证。所有接收到正确提案者的区块提案的全节点通过调用ABCI函数[`BeginBlock`](00-overview-app.md#beginblocker-and-endblocker)，对每个交易调用`DeliverTx`，以及[`EndBlock`](00-overview-app.md#beginblocker-and-endblocker)来执行交易。虽然每个全节点都在本地运行所有操作，但这个过程产生了一个单一的、明确的结果，因为消息的状态转换是确定性的，并且交易在区块提案中是明确有序的。
+
+```text
+		-----------------------
+		|Receive Block Proposal|
+		-----------------------
+		          |
+			  v
+		-----------------------
+		| BeginBlock	      |
+		-----------------------
+		          |
+			  v
+		-----------------------
+		| DeliverTx(tx0)      |
+		| DeliverTx(tx1)      |
+		| DeliverTx(tx2)      |
+		| DeliverTx(tx3)      |
+		|	.	      |
+		|	.	      |
+		|	.	      |
+		-----------------------
+		          |
+			  v
+		-----------------------
+		| EndBlock	      |
+		-----------------------
+		          |
+			  v
+		-----------------------
+		| Consensus	      |
+		-----------------------
+		          |
+			  v
+		-----------------------
+		| Commit	      |
+		-----------------------
+```
+
+### DeliverTx
+
+在[`BaseApp`](../advanced-concepts/00-baseapp.md)中定义的`DeliverTx` ABCI函数完成了大部分的状态转换：它按照共识期间提交的顺序，为每个交易运行。在底层，`DeliverTx`几乎与`CheckTx`相同，但是调用交付模式下的[`runTx`](../advanced-concepts/00-baseapp.md#runtx)函数，而不是检查模式。全节点不再使用`checkState`，而是使用`deliverState`：
+
+* **解码：** 由于`DeliverTx`是一个ABCI调用，`Tx`以编码的`[]byte`形式接收。节点首先解组交易，使用应用程序中定义的[`TxConfig`](00-overview-app#register-codec)，然后在`runTxModeDeliver`中调用`runTx`，这与`CheckTx`非常相似，但也执行和写入状态变化。
+
+* **检查和`AnteHandler`：** 全节点再次调用`validateBasicMsgs`和`AnteHandler`。这次检查发生的原因是它们在添加到内存池阶段期间可能没有看到相同的交易，而且恶意的提案者可能会包含无效的交易。这里的一个区别是`AnteHandler`不会将`gas-prices`与节点的`min-gas-prices`进行比较，因为该值是每个节点本地的 - 节点之间的不同值会产生不确定的结果。
+
+* **`MsgServiceRouter`:** 在 `CheckTx` 完成后，`DeliverTx` 继续运行 [`runMsgs`](../advanced-concepts/00-baseapp.md#runtx-antehandler-runmsgs-posthandler) 来完全执行事务中的每个 `Msg`。由于事务可能包含来自不同模块的消息，`BaseApp` 需要知道在哪个模块中找到适当的处理程序。这是通过 `BaseApp` 的 `MsgServiceRouter` 实现的，以便可以通过模块的 Protobuf [`Msg` 服务](../../integrate/building-modules/03-msg-services.md) 进行处理。对于 `LegacyMsg` 路由，通过 [模块管理器](../../integrate/building-modules/01-module-manager.md) 调用 `Route` 函数来检索路由名称，并在模块中找到传统的 [`Handler`](../../integrate/building-modules/03-msg-services.md#handler-type)。
+
+* **`Msg` 服务：** Protobuf `Msg` 服务负责执行 `Tx` 中的每个消息，并导致状态转换持久化在 `deliverTxState` 中。
+
+* **PostHandlers：** [`PostHandler`](../advanced-concepts/00-baseapp.md#posthandler) 在消息执行后运行。如果它们失败，`runMsgs` 的状态更改以及 `PostHandlers` 的状态更改都会被回滚。
+
+* **Gas：** 在交付 `Tx` 的过程中，使用 `GasMeter` 来跟踪使用了多少 gas；如果执行完成，`GasUsed` 会被设置并在 `abci.ResponseDeliverTx` 中返回。如果执行停止，因为 `BlockGasMeter` 或 `GasMeter` 用完或其他原因出错，最后的延迟函数会适当地报错或 panic。
+
+如果由于 `Tx` 无效或 `GasMeter` 用完而导致的状态更改失败，事务处理将终止，并且回滚任何状态更改。在区块提案中的无效事务会导致验证节点拒绝该区块，并投票支持一个 `nil` 区块。
+
+### 提交
+
+最后一步是节点提交区块和状态更改。验证节点执行前面的状态转换步骤以验证事务，然后对区块进行签名以确认。非验证节点的全节点不参与共识 - 也就是说，它们无法投票 - 但会监听投票以了解是否应该提交状态更改。
+
+当它们收到足够的验证者投票（2/3+ _precommits_，按投票权重计算），全节点会提交一个新的区块添加到区块链中，并在应用层面上完成状态转换。生成一个新的状态根作为状态转换的默克尔证明。应用程序使用从[Baseapp](../advanced-concepts/00-baseapp.md)继承的[`Commit`](../advanced-concepts/00-baseapp.md#commit) ABCI方法；它通过将`deliverState`写入应用程序的内部状态来同步所有的状态转换。一旦状态变化被提交，`checkState`从最近提交的状态重新开始，`deliverState`重置为`nil`以保持一致并反映这些变化。
+
+请注意，并非所有的区块都具有相同数量的交易，共识可能导致一个`nil`区块或者一个没有任何交易的区块。在公共区块链网络中，验证者也可能是**拜占庭**的，即恶意的，这可能会阻止`Tx`被提交到区块链中。可能的恶意行为包括提议者决定通过将其从区块中排除来审查`Tx`，或者验证者对该区块投反对票。
+
+此时，`Tx`的交易生命周期结束：节点已验证其有效性，通过执行其状态变化将其交付，并提交这些变化。`Tx`本身以`[]byte`形式存储在一个区块中，并追加到区块链中。
+
+
 # Transaction Lifecycle
 
 :::note Synopsis

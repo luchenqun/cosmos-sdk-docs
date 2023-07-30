@@ -1,3 +1,150 @@
+# ADR 60: ABCI 1.0 集成（第一阶段）
+
+## 更新日志
+
+* 2022-08-10：初稿（@alexanderbez，@tac0turtle）
+* 2022年11月12日：根据初始实现 [PR](https://github.com/cosmos/cosmos-sdk/pull/13453) 更新 `PrepareProposal` 和 `ProcessProposal` 语义（@alexanderbez）
+
+## 状态
+
+已接受
+
+## 摘要
+
+本 ADR 描述了在 Cosmos SDK 中初步采用 [ABCI 1.0](https://github.com/tendermint/tendermint/blob/master/spec/abci%2B%2B/README.md)，即 ABCI 的下一代演进。ABCI 1.0 旨在为应用开发人员提供更多灵活性和对应用和共识语义的控制，例如应用内存池、进程内预言机和订单簿式匹配引擎。
+
+## 背景
+
+Tendermint 将发布 ABCI 1.0。值得注意的是，在撰写本文时，Tendermint 正在发布 v0.37.0，其中将包括 `PrepareProposal` 和 `ProcessProposal`。
+
+`PrepareProposal` ABCI 方法涉及块提议者请求应用评估一系列要包含在下一个块中的交易，这些交易被定义为 `TxRecord` 对象的切片。应用可以接受、拒绝或完全忽略其中的一些或全部交易。这是一个重要的考虑因素，因为应用可以基本上定义和控制自己的内存池，从而通过完全忽略 Tendermint 发送的 `TxRecords`，优先处理自己的交易，从而定义复杂的交易优先级和过滤机制。这实际上意味着 Tendermint 内存池更像是一个八卦数据结构。
+
+第二个 ABCI 方法 `ProcessProposal` 用于处理块提议者根据 `PrepareProposal` 定义的提议。需要注意以下几点：
+
+* `ProcessProposal` 的执行必须是确定性的。
+* `PrepareProposal` 和 `ProcessProposal` 之间必须存在一致性。换句话说，对于任意两个正确的进程 *p* 和 *q*，如果 *q* 的 Tendermint 在 *u<sub>p</sub>* 上调用 `RequestProcessProposal`，则 *q* 的应用程序在 `ResponseProcessProposal` 中返回 ACCEPT。
+
+重要提示：在ABCI 1.0集成中，应用程序**不负责**锁定语义，Tendermint仍然负责此功能。然而，在未来，应用程序将负责锁定，从而实现并行执行的可能性。
+
+## 决策
+
+我们将在Cosmos SDK的下一个主要版本中集成ABCI 1.0，该版本将在Tendermint v0.37.0中引入。我们将在`BaseApp`类型上集成ABCI 1.0方法。我们将在下面逐个描述这两个方法的实现。
+
+在描述这两个新方法的实现之前，重要提示：现有的ABCI方法，如`CheckTx`、`DeliverTx`等，仍然存在，并且具有与现在相同的功能。
+
+### `PrepareProposal`
+
+在评估如何实现`PrepareProposal`的决策之前，重要提示：`CheckTx`仍然会被执行，并且将负责评估交易的有效性，就像现在一样，但有一个非常重要的**附加**区别。
+
+在执行`CheckTx`中的交易时，应用程序现在会将有效的交易（即通过AnteHandler的交易）添加到自己的mempool数据结构中。为了提供满足应用程序开发者不同需求的灵活方法，我们将定义一个mempool接口和一个使用Golang泛型的数据结构，使开发者只需关注交易排序。需要绝对完全控制的开发者可以实现自己的自定义mempool实现。
+
+我们定义通用的mempool接口如下（可能会有变化）：
+
+```go
+type Mempool interface {
+	// Insert attempts to insert a Tx into the app-side mempool returning
+	// an error upon failure.
+	Insert(sdk.Context, sdk.Tx) error
+
+	// Select returns an Iterator over the app-side mempool. If txs are specified,
+	// then they shall be incorporated into the Iterator. The Iterator must
+	// closed by the caller.
+	Select(sdk.Context, [][]byte) Iterator
+
+	// CountTx returns the number of transactions currently in the mempool.
+	CountTx() int
+
+	// Remove attempts to remove a transaction from the mempool, returning an error
+	// upon failure.
+	Remove(sdk.Tx) error
+}
+
+// Iterator defines an app-side mempool iterator interface that is as minimal as
+// possible. The order of iteration is determined by the app-side mempool
+// implementation.
+type Iterator interface {
+	// Next returns the next transaction from the mempool. If there are no more
+	// transactions, it returns nil.
+	Next() Iterator
+
+	// Tx returns the transaction at the current position of the iterator.
+	Tx() sdk.Tx
+}
+```
+
+我们将定义一个`Mempool`的实现，由`nonceMempool`定义，它将涵盖大多数基本应用程序用例。具体而言，它将按照交易发送者对交易进行优先级排序，允许同一发送者的多个交易。
+
+默认的应用程序端mempool实现`nonceMempool`将在一个跳表数据结构上运行。具体而言，全局最低nonce的交易将优先处理。具有相同nonce的交易将按发送者地址进行优先级排序。
+
+```go
+type nonceMempool struct {
+	txQueue *huandu.SkipList
+}
+```
+
+之前的讨论<sup>1</sup>已经达成共识，Tendermint将通过`RequestPrepareProposal`向应用程序发起请求，获取从Tendermint的本地mempool中获取的一定数量的交易。具体获取的交易数量将由本地操作员配置确定。这被称为讨论中所见的“一次性方法”。
+
+当Tendermint从本地mempool中获取交易并通过`RequestPrepareProposal`发送给应用程序时，应用程序将需要评估这些交易。具体来说，它需要告知Tendermint是否应该拒绝或包含每个交易。注意，应用程序甚至可以完全用其他交易替换交易。
+
+在评估`RequestPrepareProposal`中的交易时，应用程序将忽略请求中发送给它的*所有*交易，并从自己的mempool中获取最多`RequestPrepareProposal.max_tx_bytes`字节的交易。
+
+由于应用程序在`CheckTx`执行期间可以在`Insert`中插入或注入交易，建议应用程序在`PrepareProposal`期间获取交易时确保交易的有效性。然而，有效性的具体含义完全由应用程序确定。
+
+Cosmos SDK将提供一个默认的`PrepareProposal`实现，仅选择最多`MaxBytes`个*有效*交易。
+
+然而，应用程序可以通过自己的实现覆盖此默认实现，并通过`SetPrepareProposal`将其设置在`BaseApp`上。
+
+
+### `ProcessProposal`
+
+`ProcessProposal` ABCI方法相对简单。它负责确保包含从`PrepareProposal`步骤中选择的交易的建议块的有效性。然而，应用程序如何确定建议块的有效性取决于应用程序及其不同的用例。对于大多数应用程序，简单地调用`AnteHandler`链就足够了，但也可能有其他需要更多控制验证过程的应用程序，例如确保交易按特定顺序或包含特定交易。虽然理论上可以通过自定义的`AnteHandler`实现来实现这一点，但这不是最简洁的用户体验或最高效的解决方案。
+
+相反，我们将在现有的`Application`接口上定义一个额外的ABCI接口方法，类似于现有的ABCI方法，如`BeginBlock`或`EndBlock`。这个新的接口方法将被定义如下：
+
+```go
+ProcessProposal(sdk.Context, abci.RequestProcessProposal) error {}
+```
+
+注意，我们必须在`Context`参数上使用一个新的内部分支状态来调用`ProcessProposal`，因为我们不能简单地使用现有的`checkState`，因为此时`BaseApp`已经有一个修改过的`checkState`。因此，在执行`ProcessProposal`时，我们会在`deliverState`的基础上创建一个类似的分支状态`processProposalState`。注意，`processProposalState`永远不会被提交，并且在`ProcessProposal`执行完毕后完全被丢弃。
+
+Cosmos SDK将提供`ProcessProposal`的默认实现，其中所有交易都将使用CheckTx流程（即AnteHandler）进行验证，并且除非任何交易无法解码，否则始终返回ACCEPT。
+
+### `DeliverTx`
+
+由于在`PrepareProposal`期间交易并没有真正从应用程序侧的内存池中移除，因为`ProcessProposal`可能会失败或需要多轮，并且我们不希望丢失交易，所以我们需要在`DeliverTx`期间最终从应用程序侧的内存池中移除交易，因为在这个阶段，交易正在被包含在提议的区块中。
+
+或者，我们可以在`PrepareProposal`的清理阶段将交易真正地从中移除，并在`ProcessProposal`失败的情况下将它们添加回应用程序侧的内存池中。
+
+## 后果
+
+### 向后兼容性
+
+ABCI 1.0与Cosmos SDK和Tendermint的先前版本自然不兼容。例如，向不支持ABCI 1.0的同一应用程序请求`RequestPrepareProposal`将自然失败。
+
+然而，在集成的第一阶段，现有的ABCI方法将像今天一样存在并且按照当前的方式工作。
+
+### 积极影响
+
+* 应用程序现在完全控制交易的排序和优先级。
+* 为ABCI 1.0的完全集成奠定了基础，这将解锁更多关于区块构建和与Tendermint共识引擎集成的应用程序端用例。
+
+### 负面影响
+
+* 需要在Tendermint和Cosmos SDK之间复制“mempool”，作为一个收集和存储未提交交易的通用数据结构。
+* 在块执行的上下文中，Tendermint和Cosmos SDK之间需要额外的请求。尽管如此，开销应该可以忽略不计。
+* 不向后兼容之前的Tendermint和Cosmos SDK版本。
+
+## 进一步讨论
+
+可以使用不同的数据结构和实现方式来设计`Mempool[T MempoolTx]`的应用端实现，每种方式都有不同的权衡。所提议的解决方案保持简单，并涵盖了大多数基本应用所需的情况。可以做出权衡来提高对提供的mempool实现的收割和插入性能。
+
+## 参考资料
+
+* https://github.com/tendermint/tendermint/blob/master/spec/abci%2B%2B/README.md
+* [1] https://github.com/tendermint/tendermint/issues/7750#issuecomment-1076806155
+* [2] https://github.com/tendermint/tendermint/issues/7750#issuecomment-1075717151
+
+
 # ADR 60: ABCI 1.0 Integration (Phase I)
 
 ## Changelog

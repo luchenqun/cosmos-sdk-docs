@@ -1,5 +1,342 @@
 # ADR 050: SIGN_MODE_TEXTUAL
 
+## 更新日志
+
+* 2021年12月06日：初稿。
+* 2022年02月07日：由Ledger团队阅读并概念确认。
+* 2022年05月16日：将状态更改为已接受。
+* 2022年08月11日：要求对交易原始字节进行签名。
+* 2022年09月07日：添加自定义的`Msg`渲染器。
+* 2022年09月18日：使用结构化格式代替文本行。
+* 2022年11月23日：指定CBOR编码。
+* 2022年12月01日：链接到单独的JSON文件中的示例。
+* 2022年12月06日：重新排序信封屏幕。
+* 2022年12月14日：提及反向操作的异常情况。
+* 2023年01月23日：将Screen.Text更改为Title+Content。
+* 2023年03月07日：将SignDoc从数组更改为包含数组的结构。
+* 2023年03月20日：引入一个初始化为0的规范版本。
+
+## 状态
+
+已接受。实施已开始。仍需完善小值渲染器的细节。
+
+规范版本：0。
+
+## 摘要
+
+本ADR指定了SIGN_MODE_TEXTUAL，一种新的基于字符串的签名模式，旨在用于与硬件设备进行签名。
+
+## 背景
+
+基于Protobuf的SIGN_MODE_DIRECT在[ADR-020](adr-020-protobuf-transaction-encoding.md)中引入，并打算在大多数情况下替代SIGN_MODE_LEGACY_AMINO_JSON，例如移动钱包和CLI密钥环。然而，[Ledger](https://www.ledger.com/)硬件钱包仍在使用SIGN_MODE_LEGACY_AMINO_JSON来显示签名字节给用户。硬件钱包无法转换为SIGN_MODE_DIRECT，原因如下：
+
+* SIGN_MODE_DIRECT是基于二进制的，因此不适合显示给最终用户。从技术上讲，硬件钱包可以简单地将签名字节显示给用户。但这将被视为盲目签名，并且存在安全问题。
+* 由于内存限制，硬件无法解码Protobuf签名字节，因为Protobuf定义需要嵌入在硬件设备上。
+
+为了从SDK中移除Amino，需要为硬件设备创建一种新的签名模式。[初步讨论](https://github.com/cosmos/cosmos-sdk/issues/6513)提议采用基于文本的签名模式，本ADR正式指定了该模式。
+
+在SIGN_MODE_TEXTUAL中，事务被渲染为文本表示形式，然后发送到安全设备或子系统供用户审查和签名。
+与`SIGN_MODE_DIRECT`不同，传输的数据可以在处理和显示能力有限的设备上简单解码为可读文本。
+
+文本表示形式是一系列_屏幕_。
+每个屏幕都应该在小型设备（如Ledger）上完整显示（如果可能）。
+一个屏幕大致相当于一行短文本。
+大屏幕可以分成几个部分显示，就像长文本行被换行一样，
+因此没有给出硬性指导，但40个字符是一个好的目标。
+屏幕用于显示标量值的单个键/值对
+（或具有紧凑表示法的复合值，如`Coins`）
+或引入或结束较大的分组。
+
+文本可以包含完整范围的Unicode代码点，包括控制字符和空字符。
+设备负责决定如何显示无法本地渲染的字符。
+有关指导，请参阅[附录2](adr-050-sign-mode-textual-annex2.md)。
+
+屏幕具有非负的缩进级别，以表示复合或嵌套结构。
+缩进级别为零是顶级。
+缩进通过某种设备特定的机制显示。
+消息引用符号是一个适当的模型，例如
+前导的`>`字符或在更高级显示器上的竖线。
+
+某些屏幕被标记为_专家_屏幕，
+只有在查看者选择选择额外细节时才显示。
+专家屏幕用于很少有用的信息，
+或者仅需要出现以确保签名完整性（见下文）。
+
+### 可逆渲染
+
+我们要求事务的渲染是可逆的：
+必须存在一个解析函数，对于每个事务，
+当渲染为文本表示形式时，
+解析该表示形式会产生一个与原始消息在proto等价性下等效的proto消息。
+
+请注意，这个逆函数不需要对整个文本数据域执行正确的解析或错误信号。
+仅仅是有效事务范围在渲染和解析的组合下是可逆的。
+
+请注意，存在反函数确保渲染的文本包含原始交易的完整信息，而不是哈希或子集。
+
+对于太大以至于无法有意义地显示的数据（例如长度超过32字节的字节字符串），我们对可逆性做出了例外。在这种情况下，我们可以选择使用具有加密强度的哈希值进行选择性渲染。在这些情况下，找到具有相同渲染的不同交易仍然是计算上不可行的。然而，我们必须确保哈希计算足够简单，以便在没有原始字节字符串时可靠地执行，至少哈希本身是合理可验证的。
+
+### 链状态
+
+渲染函数（和解析函数）可能依赖于当前的链状态。这对于读取参数（如币种显示元数据）或读取用户特定的偏好设置（如语言或地址别名）非常有用。请注意，如果观察到的状态在签名生成和交易包含在区块中之间发生变化，交付时间的渲染可能会有所不同。如果是这样，签名将无效，交易将被拒绝。
+
+### 签名和安全性
+
+为了安全起见，交易签名应具备三个属性：
+
+1. 给定交易、签名和链状态，必须能够验证签名与交易匹配，以验证签署者必须已知其各自的私钥。
+
+2. 在相同的链状态下，对于给定的签名有效的相差很大的交易是计算上不可行的。
+
+3. 用户应能够通过具有有限显示功能的简单、安全设备对签名数据给予知情同意。
+
+`SIGN_MODE_TEXTUAL` 的正确性和安全性通过展示从渲染到交易协议的反函数来保证。这意味着不可能将不同的协议缓冲区消息渲染为相同的文本。
+
+### 交易哈希的可塑性
+
+当客户端软件形成一个交易时，"原始" 交易（`TxRaw`）被序列化为一个 proto，并计算出结果字节序列的哈希值。这就是 `TxHash`，并且被各种服务用于跟踪提交的交易的生命周期。如果能够生成一个修改后的交易，其哈希值不同但签名仍然通过，那么就可能发生各种不良行为。
+
+SIGN_MODE_TEXTUAL通过将TxHash作为专家屏幕的一部分包含在渲染中，防止了此交易的篡改。
+
+### SignDoc
+
+`SIGN_MODE_TEXTUAL`的SignDoc由以下数据结构组成：
+
+```go
+type Screen struct {
+  Title string   // possibly size limited to, advised to 64 characters
+  Content string // possibly size limited to, advised to 255 characters
+  Indent uint8   // size limited to something small like 16 or 32
+  Expert bool
+}
+
+type SignDocTextual struct {
+  Screens []Screen
+}
+```
+
+我们不打算使用protobuf序列化来形成将被传输和签名的字节序列，以保持解码器的简单性。我们将使用[CBOR](https://cbor.io)（[RFC 8949](https://www.rfc-editor.org/rfc/rfc8949.html)）代替。编码由以下CDDL（[RFC 8610](https://www.rfc-editor.org/rfc/rfc8610)）定义：
+
+```
+;;; CDDL (RFC 8610) Specification of SignDoc for SIGN_MODE_TEXTUAL.
+;;; Must be encoded using CBOR deterministic encoding (RFC 8949, section 4.2.1).
+
+;; A Textual document is a struct containing one field: an array of screens.
+sign_doc = {
+  screens_key: [* screen],
+}
+
+;; The key is an integer to keep the encoding small.
+screens_key = 1
+
+;; A screen consists of a text string, an indentation, and the expert flag,
+;; represented as an integer-keyed map. All entries are optional
+;; and MUST be omitted from the encoding if empty, zero, or false.
+;; Text defaults to the empty string, indent defaults to zero,
+;; and expert defaults to false.
+screen = {
+  ? title_key: tstr,
+  ? content_key: tstr,
+  ? indent_key: uint,
+  ? expert_key: bool,
+}
+
+;; Keys are small integers to keep the encoding small.
+title_key = 1
+content_key = 2
+indent_key = 3
+expert_key = 4
+```
+
+将sign_doc直接定义为屏幕数组也已经被考虑过。然而，考虑到此规范的未来迭代可能性，选择了使用单键结构而不是前一提案，因为结构体更容易实现向后兼容。
+
+## 详细信息
+
+在接下来的示例中，屏幕将显示为文本行，缩进以'>'开头表示，专家屏幕以`*`开头标记。
+
+### 交易信封的编码
+
+我们将“交易信封”定义为交易中不在`TxBody.Messages`字段中的所有数据。交易信封包括费用、签名者信息和备注，但不包括`Msg`。`//`表示注释，不会显示在Ledger设备上。
+
+```
+Chain ID: <string>
+Account number: <uint64>
+Sequence: <uint64>
+Address: <string>
+*Public Key: <Any>
+This transaction has <int> Message(s)                       // Pluralize "Message" only when int>1
+> Message (<int>/<int>): <Any>                              // See value renderers for Any rendering.
+End of Message
+Memo: <string>                                              // Skipped if no memo set.
+Fee: <coins>                                                // See value renderers for coins rendering.
+*Fee payer: <string>                                        // Skipped if no fee_payer set.
+*Fee granter: <string>                                      // Skipped if no fee_granter set.
+Tip: <coins>                                                // Skippted if no tip.
+Tipper: <string>
+*Gas Limit: <uint64>
+*Timeout Height: <uint64>                                   // Skipped if no timeout_height set.
+*Other signer: <int> SignerInfo                             // Skipped if the transaction only has 1 signer.
+*> Other signer (<int>/<int>): <SignerInfo>
+*End of other signers
+*Extension options: <int> Any:                              // Skipped if no body extension options
+*> Extension options (<int>/<int>): <Any>
+*End of extension options
+*Non critical extension options: <int> Any:                 // Skipped if no body non critical extension options
+*> Non critical extension options (<int>/<int>): <Any>
+*End of Non critical extension options
+*Hash of raw bytes: <hex_string>                            // Hex encoding of bytes defined, to prevent tx hash malleability.
+```
+
+### 交易体的编码
+
+交易体是`Tx.TxBody.Messages`字段，它是一个`Any`数组，其中每个`Any`打包了一个`sdk.Msg`。由于`sdk.Msg`被广泛使用，它们的编码与附录1中描述的通常的`Any`数组（Protobuf：`repeated google.protobuf.Any`）略有不同。
+
+```
+This transaction has <int> message:   // Optional 's' for "message" if there's is >1 sdk.Msgs.
+// For each Msg, print the following 2 lines:
+Msg (<int>/<int>): <string>           // E.g. Msg (1/2): bank v1beta1 send coins
+<value rendering of Msg struct>
+End of transaction messages
+```
+
+#### 示例
+
+给定以下Protobuf消息：
+
+```protobuf
+message Grant {
+  google.protobuf.Any       authorization = 1 [(cosmos_proto.accepts_interface) = "cosmos.authz.v1beta1.Authorization"];
+  google.protobuf.Timestamp expiration    = 2 [(gogoproto.stdtime) = true, (gogoproto.nullable) = false];
+}
+
+message MsgGrant {
+  option (cosmos.msg.v1.signer) = "granter";
+
+  string granter = 1 [(cosmos_proto.scalar) = "cosmos.AddressString"];
+  string grantee = 2 [(cosmos_proto.scalar) = "cosmos.AddressString"];
+}
+```
+
+以及包含1个此类`sdk.Msg`的交易，我们得到以下编码：
+
+```
+This transaction has 1 message:
+Msg (1/1): authz v1beta1 grant
+Granter: cosmos1abc...def
+Grantee: cosmos1ghi...jkl
+End of transaction messages
+```
+
+### 自定义`Msg`渲染器
+
+应用程序开发人员可以选择不遵循默认渲染器对其自己的`Msg`的值输出。在这种情况下，他们可以实现自己的自定义`Msg`渲染器。这类似于[EIP4430](https://github.com/ethereum/EIPs/blob/master/EIPS/eip-4430.md)，在该规范中，智能合约开发人员选择要显示给最终用户的描述字符串。
+
+这可以通过将`cosmos.msg.textual.v1.expert_custom_renderer` Protobuf选项设置为非空字符串来完成。此选项只能在表示事务消息对象（实现`sdk.Msg`接口）的Protobuf消息上设置。
+
+```protobuf
+message MsgFooBar {
+  // Optional comments to describe in human-readable language the formatting
+  // rules of the custom renderer.
+  option (cosmos.msg.textual.v1.expert_custom_renderer) = "<unique algorithm identifier>";
+
+  // proto fields
+}
+```
+
+当在`Msg`上设置此选项时，注册的函数将把`Msg`转换为一个或多个字符串的数组，这些字符串可以使用键/值格式（在第3点中描述）与专家字段前缀（在第5点中描述）和任意缩进（第6点）进行渲染。这些字符串可以使用默认值渲染器从`Msg`字段中渲染，也可以使用自定义逻辑从多个字段生成。
+
+`<unique algorithm identifier>`是应用程序开发人员选择的字符串约定，用于标识自定义的`Msg`渲染器。例如，此自定义算法的文档或规范可以引用此标识符。此标识符可以具有带版本的后缀（例如`_v1`），以适应未来的更改（这将破坏共识）。我们还建议添加Protobuf注释，以用人类语言描述所使用的自定义逻辑。
+
+此外，渲染器必须提供两个函数：一个用于从Protobuf格式化为字符串，另一个用于从字符串解析为Protobuf。这两个函数由应用程序开发人员提供。为了满足第1点，解析函数必须是格式化函数的反函数。SDK不会在运行时检查此属性。但是，我们强烈建议应用程序开发人员在其应用程序存储库中包含全面的测试套件，以测试可逆性，以避免引入安全漏洞。
+
+### 要求对`TxBody`和`AuthInfo`原始字节进行签名
+
+回想一下，在链上merklelized的事务字节是[TxRaw](hhttps://buf.build/cosmos/cosmos-sdk/docs/main:cosmos.tx.v1beta1#cosmos.tx.v1beta1.TxRaw)的Protobuf二进制序列化，其中包含`body_bytes`和`auth_info_bytes`。此外，事务哈希被定义为`TxRaw`字节的SHA256哈希。我们要求用户在SIGN_MODE_TEXTUAL下对这些字节进行签名，更具体地说，对以下字符串进行签名：
+
+```
+*原始字节的哈希值：<HEX(sha256(len(body_bytes) ++ body_bytes ++ len(auth_info_bytes) ++ auth_info_bytes))>
+
+其中：
+
+* `++` 表示连接操作，
+* `HEX` 是字节的十六进制表示，全部大写，没有 `0x` 前缀，
+* `len()` 以大端字节序编码为 uint64。
+
+这是为了防止交易哈希的可塑性。关于可逆性的第一点确保了交易的 `body` 和 `auth_info` 值不可塑性，但仅仅使用第一点可能导致交易哈希仍然可塑性，因为 `body_bytes` 和 `auth_info_bytes` 中的 SIGN_MODE_TEXTUAL 字符串不遵循 `body_bytes` 和 `auth_info_bytes` 中定义的字节顺序。如果没有这个哈希值，恶意验证人或交易所可以在用户使用 SIGN_MODE_TEXTUAL 签名后拦截交易，修改其交易哈希（通过调整 `body_bytes` 或 `auth_info_bytes` 中的字节顺序），然后提交给 Tendermint。
+
+通过在 SIGN_MODE_TEXTUAL 签名负载中包含此哈希值，我们保持了与 [SIGN_MODE_DIRECT](adr-020-protobuf-transaction-encoding.md) 相同的保证级别。
+
+这些字节仅在专家模式下显示，因此前面有 `*`。
+
+## 对当前规范的更新
+
+当前规范并非一成不变，未来可能会有多次迭代。我们将此规范的更新分为两类：
+
+1. 需要更改硬件设备嵌入式应用程序的更新。
+2. 仅修改信封和值渲染器的更新。
+
+第一类更新包括更改 `Screen` 结构或其对应的 CBOR 编码。这类更新需要修改硬件签名应用程序，以便能够解码和解析新类型。还必须保证向后兼容性，以使新的硬件应用程序与现有版本的 SDK 兼容。这些更新需要多方协调：SDK 开发人员、硬件应用程序开发人员（目前为 Zondax）和客户端开发人员（例如 CosmJS）。此外，可能需要重新提交硬件设备应用程序，这根据供应商的不同可能需要一些时间。因此，我们建议尽量避免此类更新。
+```
+
+第二类更新包括对任何值渲染器或事务信封的更改。例如，可以交换信封中的字段顺序，或修改时间戳格式。由于 SIGN_MODE_TEXTUAL 将 `Screen` 发送到硬件设备，这种类型的更改不需要硬件钱包应用程序更新。但是，它们会破坏状态机，并且必须进行相应的文档记录。它们需要 SDK 开发人员与客户端开发人员（例如 CosmJS）的协调，以便更新在时间上尽可能接近同时发布。
+
+我们定义了一个规范版本，它是一个整数，必须在每个类别的更新中递增。该规范版本将由 SDK 的实现公开，并可以与客户端进行通信。例如，SDK v0.48 可能使用规范版本 1，而 SDK v0.49 可能使用 2；通过这种版本控制，客户端可以根据目标 SDK 版本来构建 SIGN_MODE_TEXTUAL 事务。
+
+当前的规范版本在本文档顶部的 "状态" 部分中定义。它初始化为 `0`，以允许在选择如何定义未来版本时具有灵活性，因为它可以以向后兼容的方式向 SignDoc Go 结构或 Protobuf 中添加字段。
+
+## 硬件设备的附加格式
+
+请参阅[附录 2](adr-050-sign-mode-textual-annex2.md)。
+
+## 示例
+
+1. 最简 MsgSend：[查看交易](https://github.com/cosmos/cosmos-sdk/blob/094abcd393379acbbd043996024d66cd65246fb1/tx/textual/internal/testdata/e2e.json#L2-L70)。
+2. 包含各种元素的交易：[查看交易](https://github.com/cosmos/cosmos-sdk/blob/094abcd393379acbbd043996024d66cd65246fb1/tx/textual/internal/testdata/e2e.json#L71-L270)。
+
+以下示例存储在一个 JSON 文件中，包含以下字段：
+- `proto`：事务在 ProtoJSON 中的表示形式，
+- `screens`：将事务渲染为 SIGN_MODE_TEXTUAL 屏幕，
+- `cbor`：事务的签名字节，即屏幕的 CBOR 编码。
+
+## 后果
+
+### 向后兼容性
+
+SIGN_MODE_TEXTUAL 是纯粹的增加功能，不会破坏与其他签名模式的向后兼容性。
+
+### 积极的
+
+* 以硬件设备友好的方式进行签名。
+* 一旦 SIGN_MODE_TEXTUAL 被发布，SIGN_MODE_LEGACY_AMINO_JSON 可以被弃用和移除。从长远来看，一旦生态系统完全迁移，Amino 可以完全移除。
+
+### 消极的
+
+* 一些字段仍然以非人类可读的方式进行编码，比如十六进制的公钥。
+* 需要发布新的账本应用程序，目前还不清楚。
+
+### 中立的
+
+* 如果交易复杂，字符串数组可以任意长，一些用户可能会跳过一些屏幕并盲目签名。
+
+## 进一步讨论
+
+* 需要完善一些关于值渲染器的细节，请参见[附录1](adr-050-sign-mode-textual-annex1.md)。
+* 账本应用程序是否能够同时支持 SIGN_MODE_LEGACY_AMINO_JSON 和 SIGN_MODE_TEXTUAL？
+* 开放问题：我们是否应该添加一个 Protobuf 字段选项，允许应用程序开发人员覆盖某些 Protobuf 字段和消息的文本表示形式？这类似于以太坊的[EIP4430](https://github.com/ethereum/EIPs/pull/4430)，其中合约开发人员决定文本表示形式。
+* 国际化。
+
+## 参考资料
+
+* [附录1](adr-050-sign-mode-textual-annex1.md)
+
+* 初始讨论：https://github.com/cosmos/cosmos-sdk/issues/6513
+* 工作组使用的实时文档：https://hackmd.io/fsZAO-TfT0CKmLDtfMcKeA?both
+* 工作组会议记录：https://hackmd.io/7RkGfv_rQAaZzEigUYhcXw
+* 以太坊的“描述交易”：https://github.com/ethereum/EIPs/pull/4430
+
+
+# ADR 050: SIGN_MODE_TEXTUAL
+
 ## Changelog
 
 * Dec 06, 2021: Initial Draft.

@@ -1,3 +1,98 @@
+# 推荐的文件夹结构
+
+:::note 概要
+本文档概述了Cosmos SDK模块的推荐结构。这些想法旨在作为建议应用。鼓励应用开发者改进和贡献模块结构和开发设计。
+:::
+
+## 结构
+
+典型的Cosmos SDK模块可以按照以下方式组织：
+
+```shell
+proto
+└── {project_name}
+    └── {module_name}
+        └── {proto_version}
+            ├── {module_name}.proto
+            ├── event.proto
+            ├── genesis.proto
+            ├── query.proto
+            └── tx.proto
+```
+
+* `{module_name}.proto`：模块的常见消息类型定义。
+* `event.proto`：与事件相关的模块消息类型定义。
+* `genesis.proto`：与创世状态相关的模块消息类型定义。
+* `query.proto`：模块的查询服务和相关消息类型定义。
+* `tx.proto`：模块的消息服务和相关消息类型定义。
+
+```shell
+x/{module_name}
+├── client
+│   ├── cli
+│   │   ├── query.go
+│   │   └── tx.go
+│   └── testutil
+│       ├── cli_test.go
+│       └── suite.go
+├── exported
+│   └── exported.go
+├── keeper
+│   ├── genesis.go
+│   ├── grpc_query.go
+│   ├── hooks.go
+│   ├── invariants.go
+│   ├── keeper.go
+│   ├── keys.go
+│   ├── msg_server.go
+│   └── querier.go
+├── module
+│   └── module.go
+│   └── abci.go
+│   └── autocli.go
+├── simulation
+│   ├── decoder.go
+│   ├── genesis.go
+│   ├── operations.go
+│   └── params.go
+├── {module_name}.pb.go
+├── codec.go
+├── errors.go
+├── events.go
+├── events.pb.go
+├── expected_keepers.go
+├── genesis.go
+├── genesis.pb.go
+├── keys.go
+├── msgs.go
+├── params.go
+├── query.pb.go
+├── tx.pb.go
+└── 05-depinject.md
+```
+
+* `client/`：模块的CLI客户端功能实现和模块的CLI测试套件。
+* `exported/`：模块的导出类型 - 通常是接口类型。如果一个模块依赖于另一个模块的保管者，它应该通过`expected_keepers.go`文件（见下文）作为接口合同接收保管者，以避免对实现保管者的模块的直接依赖。然而，这些接口合同可以定义操作和/或返回特定于实现保管者的模块的类型的方法，这就是`exported/`的作用。在`exported/`中定义的接口类型使用规范类型，允许模块通过`expected_keepers.go`文件接收保管者作为接口合同。这种模式可以使代码保持DRY，并减轻导入循环混乱。
+* `keeper/`：模块的`Keeper`和`MsgServer`实现。
+* `module/`：模块的`AppModule`和`AppModuleBasic`实现。
+    * `abci.go`：模块的`BeginBlocker`和`EndBlocker`实现（只有在需要定义`BeginBlocker`和/或`EndBlocker`时才需要此文件）。
+    * `autocli.go`：模块的[autocli](../tooling/03-autocli.md)选项。
+* `simulation/`：模块的[simulation](14-simulator.md)包定义了区块链模拟器应用程序（`simapp`）使用的函数。
+* `REAMDE.md`：模块的规范文档，概述了重要概念、状态存储结构以及消息和事件类型定义。了解如何在[规范指南](../spec/SPEC_MODULE.md)中编写模块规范。
+* 根目录包括消息、事件和创世状态的类型定义，包括Protocol Buffers生成的类型定义。
+    * `codec.go`：模块的接口类型的注册方法。
+    * `errors.go`：模块的哨兵错误。
+    * `events.go`：模块的事件类型和构造函数。
+    * `expected_keepers.go`：模块的[预期保管者](06-keeper.md#type-definition)接口。
+    * `genesis.go`：模块的创世状态方法和辅助函数。
+    * `keys.go`：模块的存储键和相关的辅助函数。
+    * `msgs.go`：模块的消息类型定义和相关方法。
+    * `params.go`：模块的参数类型定义和相关方法。
+    * `*.pb.go`：模块的Protocol Buffers生成的类型定义（如上述各自的`*.proto`文件中定义）。
+
+I'm sorry, but as an AI text-based model, I am unable to receive or process any files or attachments. However, you can copy and paste the Markdown content here, and I will do my best to translate it for you.
+
+
 
 
 # Recommended Folder Structure

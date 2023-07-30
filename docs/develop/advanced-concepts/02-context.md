@@ -1,3 +1,86 @@
+# 上下文
+
+:::note 概要
+`context` 是一个数据结构，旨在从一个函数传递到另一个函数，携带有关应用程序当前状态的信息。它提供了对分支存储（整个状态的安全分支）以及有用的对象和信息（如 `gasMeter`、`区块高度`、`共识参数`等）的访问。
+:::
+
+:::note
+
+### 先决条件阅读
+
+* [Cosmos SDK 应用程序的解剖](../high-level-concepts/00-overview-app.md)
+* [交易的生命周期](../high-level-concepts/01-tx-lifecycle.md)
+
+:::
+
+## 上下文定义
+
+Cosmos SDK 的 `Context` 是一个自定义数据结构，它以 Go 的标准库 [`context`](https://pkg.go.dev/context) 作为基础，并在其定义中包含许多特定于 Cosmos SDK 的其他类型。`Context` 在事务处理中至关重要，因为它允许模块轻松访问它们在 [`multistore`](04-store.md#multistore) 中的相应 [存储](04-store.md#base-layer-kvstores) 并检索事务上下文，例如块头和 gas 计量器。
+
+```go reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/types/context.go#L17-L44
+```
+
+* **基本上下文：** 基本类型是 Go 的 [Context](https://pkg.go.dev/context)，在下面的 [Go 上下文包](#go-context-package) 部分中有进一步解释。
+* **Multistore：** 每个应用程序的 `BaseApp` 包含一个 [`CommitMultiStore`](04-store.md#multistore)，在创建 `Context` 时提供。调用 `KVStore()` 和 `TransientStore()` 方法允许模块使用其唯一的 `StoreKey` 获取它们各自的 [`KVStore`](04-store.md#base-layer-kvstores)。
+* **Header：** [header](https://docs.cometbft.com/v0.37/spec/core/data_structures#header) 是一个区块链类型。它携带有关区块链状态的重要信息，例如区块高度和当前区块的提议者。
+* **Header Hash：** 当在 `abci.RequestBeginBlock` 中获取的当前区块头哈希。
+* **Chain ID：** 区块所属的区块链的唯一标识号。
+* **Transaction Bytes：** 使用上下文处理的事务的 `[]byte` 表示。每个事务都由 Cosmos SDK 和共识引擎（如 CometBFT）的各个部分在其 [生命周期](../high-level-concepts/01-tx-lifecycle.md) 中处理，其中一些部分对事务类型没有任何了解。因此，事务被编组为通用的 `[]byte` 类型，使用某种 [编码格式](06-encoding.md)（如 [Amino](06-encoding.md)）。
+* **Logger：** 来自 CometBFT 库的 `logger`。了解更多关于日志的信息，请参阅[此处](https://docs.cometbft.com/v0.37/core/configuration)。模块调用此方法以创建自己独特的模块特定的日志记录器。
+* **VoteInfo：** ABCI 类型 [`VoteInfo`](https://docs.cometbft.com/master/spec/abci/abci.html#voteinfo) 的列表，其中包括验证人的名称和一个指示其是否已签署该区块的布尔值。
+* **Gas Meters：** 具体而言，用于使用上下文处理的当前事务的 [`gasMeter`](../high-level-concepts/04-gas-fees.md#main-gas-meter) 和整个所属区块的 [`blockGasMeter`](../high-level-concepts/04-gas-fees.md#block-gas-meter)。用户指定他们希望为其事务的执行支付多少费用；这些 gas 计量器跟踪到目前为止在事务或区块中使用了多少 [gas](../high-level-concepts/04-gas-fees.md)。如果 gas 计量器用完，执行将停止。
+* **CheckTx 模式：** 一个布尔值，指示是否应在 `CheckTx` 或 `DeliverTx` 模式下处理事务。
+* **Min Gas Price：** 节点愿意接受的最低 [gas](../high-level-concepts/04-gas-fees.md) 价格，以便将事务包含在其区块中。此价格是每个节点单独配置的本地值，因此**不应在导致状态转换的任何函数中使用**。
+* **共识参数：** ABCI 类型的[共识参数](https://docs.cometbft.com/master/spec/abci/apps.html#consensus-parameters)，用于指定区块链的某些限制，例如区块的最大 gas。
+* **事件管理器：** 事件管理器允许任何具有访问 `Context` 的调用者发出 [`Events`](08-events.md)。模块可以通过定义各种 `Types` 和 `Attributes` 或使用在 `types/` 中找到的公共定义来定义模块特定的 `Events`。客户端可以订阅或查询这些 `Events`。这些 `Events` 在 `DeliverTx`、`BeginBlock` 和 `EndBlock` 中收集，并返回给 CometBFT 进行索引。例如：
+* **优先级：** 事务优先级，仅在 `CheckTx` 中相关。
+* **KV `GasConfig`：** 允许应用程序为 `KVStore` 设置自定义的 `GasConfig`。
+* **Transient KV `GasConfig`：** 允许应用程序为临时 `KVStore` 设置自定义的 `GasConfig`。
+
+## Go Context 包
+
+[Golang Context Package](https://pkg.go.dev/context) 定义了一个基本的 `Context`。`Context` 是一个不可变的数据结构，用于在 API 和进程之间传递请求范围的数据。`Context` 还被设计为支持并发，并可在 goroutine 中使用。
+
+`Context` 应该是**不可变的**；不应该对其进行编辑。相反，惯例是使用 `With` 函数从父级创建一个子级 `Context`。例如：
+
+```go
+childCtx = parentCtx.WithBlockHeader(header)
+```
+
+[Golang Context Package](https://pkg.go.dev/context) 文档指导开发人员在处理过程中显式地将 `ctx` 作为第一个参数传递。
+
+## 存储分支
+
+`Context` 包含一个 `MultiStore`，它允许使用 `CacheMultiStore` 进行分支和缓存功能（在 `CacheMultiStore` 中的查询会被缓存以避免未来的往返请求）。每个 `KVStore` 都会在一个安全且隔离的临时存储中进行分支。进程可以自由地向 `CacheMultiStore` 写入更改。如果状态转换序列顺利完成，存储分支可以在序列结束时提交到底层存储，或者如果出现问题可以忽略它们。`Context` 的使用模式如下：
+
+1. 进程从其父进程接收一个 `Context` `ctx`，该 `Context` 提供执行进程所需的信息。
+2. `ctx.ms` 是一个**分支存储**，即创建了一个 [multistore](04-store.md#multistore) 的分支，以便进程在执行过程中对状态进行更改，而不会改变原始的 `ctx.ms`。这对于在执行过程中需要撤销更改的情况下保护底层 multistore 是有用的。
+3. 进程在执行过程中可以从 `ctx` 中读取和写入。它可以调用子进程并根据需要将 `ctx` 传递给它。
+4. 当子进程返回时，它检查结果是成功还是失败。如果失败，则不需要执行任何操作 - 分支 `ctx` 将被简单地丢弃。如果成功，则可以通过 `Write()` 将对 `CacheMultiStore` 所做的更改提交到原始的 `ctx.ms`。
+
+例如，这是[`baseapp`](00-baseapp.md)中[`runTx`](00-baseapp.md#runtx-antehandler-runmsgs-posthandler)函数的一部分代码：
+
+```go
+runMsgCtx, msCache := app.cacheTxContext(ctx, txBytes)
+result = app.runMsgs(runMsgCtx, msgs, mode)
+result.GasWanted = gasWanted
+if mode != runTxModeDeliver {
+  return result
+}
+if result.IsOK() {
+  msCache.Write()
+}
+```
+
+以下是该过程的步骤：
+
+1. 在对交易中的消息调用`runMsgs`之前，它使用`app.cacheTxContext()`来分支和缓存上下文和多存储。
+2. `runMsgCtx` - 带有分支存储的上下文，在`runMsgs`中用于返回结果。
+3. 如果该过程在[`checkTxMode`](00-baseapp.md#checktx)中运行，则无需写入更改 - 结果会立即返回。
+4. 如果该过程在[`deliverTxMode`](00-baseapp.md#delivertx)中运行，并且结果表明所有消息都成功运行，则分支的多存储将被写回原始状态。
+
+
 
 
 # Context

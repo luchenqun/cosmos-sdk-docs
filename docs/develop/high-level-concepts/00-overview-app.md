@@ -1,3 +1,264 @@
+# Cosmos SDK 应用程序概述
+
+:::note 概要
+本文档描述了 Cosmos SDK 应用程序的核心部分，文档中使用一个名为 `app` 的占位应用程序来表示。
+:::
+
+## 节点客户端
+
+守护进程，或称为[全节点客户端](../advanced-concepts/03-node.md)，是基于 Cosmos SDK 的区块链的核心进程。网络中的参与者运行此进程来初始化其状态机，与其他全节点连接，并在新区块到来时更新其状态机。
+
+```text
+                ^  +-------------------------------+  ^
+                |  |                               |  |
+                |  |  State-machine = Application  |  |
+                |  |                               |  |   Built with Cosmos SDK
+                |  |            ^      +           |  |
+                |  +----------- | ABCI | ----------+  v
+                |  |            +      v           |  ^
+                |  |                               |  |
+Blockchain Node |  |           Consensus           |  |
+                |  |                               |  |
+                |  +-------------------------------+  |   CometBFT
+                |  |                               |  |
+                |  |           Networking          |  |
+                |  |                               |  |
+                v  +-------------------------------+  v
+```
+
+区块链全节点以二进制形式呈现，通常以 `-d` 为后缀（例如 `appd` 表示 `app`，`gaiad` 表示 `gaia`）。此二进制文件通过在 `./cmd/appd/` 目录下运行一个简单的 [`main.go`](../advanced-concepts/03-node.md#main-function) 函数来构建。通常，此操作通过 [Makefile](#dependencies-and-makefile) 完成。
+
+构建主二进制文件后，可以通过运行 [`start` 命令](../advanced-concepts/03-node.md#start-command) 来启动节点。此命令函数主要执行以下三个操作：
+
+1. 创建一个在 [`app.go`](#core-application-file) 中定义的状态机实例。
+2. 使用从 `~/.app/data` 文件夹中存储的 `db` 提取的最新已知状态来初始化状态机。此时，状态机的高度为 `appBlockHeight`。
+3. 创建并启动一个新的 CometBFT 实例。节点与其对等节点进行握手，获取它们的最新 `blockHeight`，如果它大于本地的 `appBlockHeight`，则回放区块以同步到此高度。节点从创世块开始，CometBFT 通过 ABCI 向 `app` 发送一个 `InitChain` 消息，触发 [`InitChainer`](#initchainer)。
+
+:::note
+启动 CometBFT 实例时，创世文件的高度为 `0`，创世文件中的状态在块高度 `1` 处提交。查询节点状态时，查询块高度为 `0` 将返回错误。
+:::
+
+## 核心应用程序文件
+
+通常情况下，状态机的核心在一个名为 `app.go` 的文件中定义。该文件主要包含了**应用程序的类型定义**和**创建和初始化应用程序的函数**。
+
+### 应用程序的类型定义
+
+在 `app.go` 中首先定义的是应用程序的 `type`。它通常由以下几个部分组成：
+
+* **对 [`baseapp`](../advanced-concepts/00-baseapp.md) 的引用。** 在 `app.go` 中定义的自定义应用程序是 `baseapp` 的扩展。当 CometBFT 将交易中继到应用程序时，`app` 使用 `baseapp` 的方法将它们路由到适当的模块。`baseapp` 实现了应用程序的大部分核心逻辑，包括所有的 [ABCI 方法](https://docs.cometbft.com/v0.37/spec/abci/) 和 [路由逻辑](../advanced-concepts/00-baseapp.md#routing)。
+* **存储键的列表**。[存储](../advanced-concepts/04-store.md)，其中包含整个状态，是在 Cosmos SDK 中实现为 [`multistore`](../advanced-concepts/04-store.md#multistore)（即存储的存储）。每个模块在 multistore 中使用一个或多个存储来持久化其部分状态。可以使用在 `app` 类型中声明的特定键访问这些存储。这些键和 `keepers` 是 Cosmos SDK 中 [对象能力模型](../advanced-concepts/10-ocap.md) 的核心。
+* **模块的 `keeper` 列表**。每个模块定义了一个称为 [`keeper`](../../integrate/building-modules/06-keeper.md) 的抽象，用于处理该模块的存储的读写操作。一个模块的 `keeper` 方法可以从其他模块中调用（如果经过授权），这就是为什么它们在应用程序的类型中声明并作为接口导出给其他模块，以便后者只能访问经过授权的函数。
+* **对 [`appCodec`](../advanced-concepts/06-encoding.md) 的引用**。应用程序的 `appCodec` 用于序列化和反序列化数据结构以便存储，因为存储只能持久化 `[]bytes`。默认的编解码器是 [Protocol Buffers](../advanced-concepts/06-encoding.md)。
+* **对 [`legacyAmino`](../advanced-concepts/06-encoding.md) 编解码器的引用**。Cosmos SDK 的某些部分尚未迁移到使用上述的 `appCodec`，仍然硬编码为使用 Amino。其他部分明确使用 Amino 以实现向后兼容性。因此，应用程序仍然持有对传统 Amino 编解码器的引用。请注意，Amino 编解码器将在即将发布的版本中从 SDK 中移除。
+* **对 [模块管理器](../../integrate/building-modules/01-module-manager.md#manager) 和 [基本模块管理器](../../integrate/building-modules/01-module-manager.md#basicmanager) 的引用**。模块管理器是一个包含应用程序模块列表的对象。它简化了与这些模块相关的操作，如注册它们的 [`Msg` 服务](../advanced-concepts/00-baseapp.md#msg-services) 和 [gRPC `Query` 服务](../advanced-concepts/00-baseapp.md#grpc-query-services)，或者为各种函数（如 [`InitChainer`](#initchainer)、[`BeginBlocker` 和 `EndBlocker`](#beginblocker-and-endblocker)）设置模块之间的执行顺序。
+
+请看一个来自 `simapp` 的应用类型定义示例，`simapp` 是用于演示和测试目的的 Cosmos SDK 自带应用程序：
+
+```go reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/simapp/app.go#L161-L203
+```
+
+### 构造函数
+
+在 `app.go` 中还定义了构造函数，该函数构造了一个新的应用程序，其类型在前面的部分中定义。该函数必须满足 `AppCreator` 签名，以便在应用程序的守护进程命令 [`start`](../advanced-concepts/03-node.md#start-command) 中使用。
+
+```go reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/server/types/app.go#L64-L66
+```
+
+该函数执行的主要操作如下：
+
+* 实例化一个新的 [`codec`](../advanced-concepts/06-encoding.md) 并使用 [基本管理器](../../integrate/building-modules/01-module-manager.md#basicmanager) 初始化应用程序的每个模块的 `codec`。
+* 使用一个 `baseapp` 实例、一个 `codec` 和所有适当的存储键实例化一个新的应用程序。
+* 使用每个应用程序模块的 `NewKeeper` 函数实例化应用程序中定义的所有 [`keeper`](#keeper) 对象。请注意，必须按正确的顺序实例化 keepers，因为一个模块的 `NewKeeper` 可能需要引用另一个模块的 `keeper`。
+* 使用应用程序的每个模块的 [`AppModule`](#application-module-interface) 对象实例化应用程序的 [模块管理器](../../integrate/building-modules/01-module-manager.md#manager)。
+* 使用模块管理器，初始化应用程序的 [`Msg` 服务](../advanced-concepts/00-baseapp.md#msg-services)、[gRPC `Query` 服务](../advanced-concepts/00-baseapp.md#grpc-query-services)、[旧版 `Msg` 路由](../advanced-concepts/00-baseapp.md#routing) 和 [旧版查询路由](../advanced-concepts/00-baseapp.md#query-routing)。当通过 CometBFT 通过 ABCI 将事务中继到应用程序时，它将使用此处定义的路由将事务路由到适当模块的 [`Msg` 服务](#msg-services)。同样，当应用程序接收到 gRPC 查询请求时，它将使用此处定义的 gRPC 路由将请求路由到适当模块的 [`gRPC 查询服务`](#grpc-query-services)。Cosmos SDK 仍然支持旧版 `Msg` 和旧版 CometBFT 查询，它们分别使用旧版 `Msg` 路由和旧版查询路由进行路由。
+* 使用模块管理器，注册应用程序模块的 [不变量](../../integrate/building-modules/07-invariants.md)。不变量是在每个区块结束时评估的变量（例如代币的总供应量）。检查不变量的过程是通过一个特殊的模块（称为 [`InvariantsRegistry`](../../integrate/building-modules/07-invariants.md#invariant-registry)）完成的。不变量的值应该等于模块中定义的预测值。如果值与预测值不同，将触发不变量注册表中定义的特殊逻辑（通常是停止链）。这对于确保没有关键错误被忽视并产生难以修复的长期影响非常有用。
+* 使用模块管理器，设置每个 [应用程序模块](#application-module-interface) 的 `InitGenesis`、`BeginBlocker` 和 `EndBlocker` 函数的执行顺序。请注意，并非所有模块都实现了这些函数。
+* 设置剩余的应用程序参数：
+    * [`InitChainer`](#initchainer)：用于在首次启动应用程序时进行初始化。
+    * [`BeginBlocker`、`EndBlocker`](#beginblocker-and-endlbocker)：在每个区块的开始和结束时调用。
+    * [`anteHandler`](../advanced-concepts/00-baseapp.md#antehandler)：用于处理费用和签名验证。
+* 挂载存储。
+* 返回应用程序。
+
+请注意，构造函数仅创建应用程序的实例，而实际状态要么从 `~/.app/data` 文件夹中传递（如果节点重新启动），要么从创世文件生成（如果节点首次启动）。
+
+以下是来自 `simapp` 的应用程序构造函数示例：
+
+```go reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/simapp/app.go#L214-L522
+```
+
+### InitChainer
+
+`InitChainer` 是一个函数，用于从创世文件初始化应用程序的状态（即初始账户的代币余额）。当应用程序接收到来自 CometBFT 引擎的 `InitChain` 消息时调用该函数，这发生在节点在 `appBlockHeight == 0`（即创世块）启动时。应用程序必须通过 [`SetInitChainer`](https://pkg.go.dev/github.com/cosmos/cosmos-sdk/baseapp#BaseApp.SetInitChainer) 方法在其 [构造函数](#constructor-function) 中设置 `InitChainer`。
+
+通常，`InitChainer` 主要由应用程序模块的 [`InitGenesis`](../../integrate/building-modules/08-genesis.md#initgenesis) 函数组成。这是通过调用模块管理器的 `InitGenesis` 函数来完成的，模块管理器又会调用其包含的每个模块的 `InitGenesis` 函数。请注意，必须在模块管理器中使用 [模块管理器](../../integrate/building-modules/01-module-manager.md) 的 `SetOrderInitGenesis` 方法设置调用模块的 `InitGenesis` 函数的顺序。这是在 [应用程序的构造函数](#constructor-function) 中完成的，而且必须在 `SetInitChainer` 之前调用 `SetOrderInitGenesis`。
+
+以下是来自 `simapp` 的 `InitChainer` 示例：
+
+```go reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/simapp/app.go#L569-L577
+```
+
+### BeginBlocker 和 EndBlocker
+
+Cosmos SDK 提供了开发人员实现代码自动执行的可能性作为其应用程序的一部分。这是通过两个名为 `BeginBlocker` 和 `EndBlocker` 的函数实现的。它们在应用程序接收到来自 CometBFT 引擎的 `BeginBlock` 和 `EndBlock` 消息时分别调用，这分别发生在每个区块的开始和结束时。应用程序必须通过 [`SetBeginBlocker`](https://pkg.go.dev/github.com/cosmos/cosmos-sdk/baseapp#BaseApp.SetBeginBlocker) 和 [`SetEndBlocker`](https://pkg.go.dev/github.com/cosmos/cosmos-sdk/baseapp#BaseApp.SetEndBlocker) 方法在其 [构造函数](#constructor-function) 中设置 `BeginBlocker` 和 `EndBlocker`。
+
+一般来说，`BeginBlocker` 和 `EndBlocker` 函数主要由应用程序模块的 [`BeginBlock` 和 `EndBlock`](../../integrate/building-modules/05-beginblock-endblock.md) 函数组成。这是通过调用模块管理器的 `BeginBlock` 和 `EndBlock` 函数来实现的，模块管理器又会调用其包含的每个模块的 `BeginBlock` 和 `EndBlock` 函数。请注意，模块的 `BeginBlock` 和 `EndBlock` 函数的调用顺序必须在模块管理器中使用 `SetOrderBeginBlockers` 和 `SetOrderEndBlockers` 方法进行设置。这是通过 [模块管理器](../../integrate/building-modules/01-module-manager.md) 在 [应用程序的构造函数](#constructor-function) 中完成的，而且必须在调用 `SetBeginBlocker` 和 `SetEndBlocker` 函数之前调用 `SetOrderBeginBlockers` 和 `SetOrderEndBlockers` 方法。
+
+值得一提的是，需要记住应用程序特定的区块链是确定性的。开发人员在 `BeginBlocker` 或 `EndBlocker` 中不能引入非确定性，并且还必须小心不要使它们过于计算密集，因为 [gas](04-gas-fees.md) 不限制 `BeginBlocker` 和 `EndBlocker` 执行的成本。
+
+以下是 `simapp` 中 `BeginBlocker` 和 `EndBlocker` 函数的示例：
+
+```go reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/simapp/app.go#L555-L563
+```
+
+### 注册编解码器
+
+`EncodingConfig` 结构是 `app.go` 文件的最后一个重要部分。该结构的目标是定义在整个应用程序中将使用的编解码器。
+
+```go reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/simapp/params/encoding.go#L9-L16
+```
+
+以下是每个字段的描述：
+
+* `InterfaceRegistry`：`InterfaceRegistry` 用于 Protobuf 编解码器处理使用 [`google.protobuf.Any`](https://github.com/protocolbuffers/protobuf/blob/master/src/google/protobuf/any.proto) 编码和解码（我们也称之为 "解包"）的接口。`Any` 可以被视为一个包含 `type_url`（实现接口的具体类型的名称）和 `value`（其编码字节）的结构体。`InterfaceRegistry` 提供了一种注册接口和实现的机制，可以安全地从 `Any` 中解包。每个应用程序模块都实现了 `RegisterInterfaces` 方法，用于注册模块自己的接口和实现。
+    * 您可以在 [ADR-019](../../integrate/architecture/adr-019-protobuf-state-encoding.md) 中了解更多关于 `Any` 的信息。
+    * 更详细地说，Cosmos SDK 使用了 Protobuf 规范的一个实现，称为 [`gogoprotobuf`](https://github.com/cosmos/gogoproto)。默认情况下，[gogo protobuf 实现的 `Any`](https://pkg.go.dev/github.com/cosmos/gogoproto/types) 使用[全局类型注册](https://github.com/cosmos/gogoproto/blob/master/proto/properties.go#L540)将在 `Any` 中打包的值解码为具体的 Go 类型。这引入了一个漏洞，即依赖树中的任何恶意模块都可以向全局 protobuf 注册表注册一个类型，并导致在引用它的事务中加载和解组它。有关更多信息，请参阅 [ADR-019](../../integrate/architecture/adr-019-protobuf-state-encoding.md)。
+* `Codec`：Cosmos SDK 中默认使用的编解码器。它由一个用于编解码状态的 `BinaryCodec` 和一个用于向用户输出数据的 `JSONCodec` 组成（例如，在 [CLI](#cli) 中）。默认情况下，SDK 使用 Protobuf 作为 `Codec`。
+* `TxConfig`：`TxConfig` 定义了一个客户端可以使用的接口，用于生成应用程序定义的具体事务类型。目前，SDK 处理两种事务类型：`SIGN_MODE_DIRECT`（使用 Protobuf 二进制作为传输编码）和 `SIGN_MODE_LEGACY_AMINO_JSON`（依赖于 Amino）。在[这里](../advanced-concepts/01-transactions.md)了解更多关于事务的信息。
+* `Amino`：Cosmos SDK 的一些旧部分仍然使用 Amino 进行向后兼容。每个模块都会暴露一个 `RegisterLegacyAmino` 方法，用于在 Amino 中注册模块的特定类型。这个 `Amino` 编解码器不应再被应用程序开发人员使用，并且将在未来的版本中被移除。
+
+应用程序应该创建自己的编码配置。
+请参考`simapp`中的`simappparams.EncodingConfig`示例：
+
+```go reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/simapp/app.go#L731-L738
+```
+
+## 模块
+
+[模块](../../integrate/building-modules/00-intro.md) 是 Cosmos SDK 应用的核心和灵魂。它们可以被视为嵌套在状态机中的状态机。当一个交易从底层的 CometBFT 引擎通过 ABCI 被传递到应用程序时，它会被 [`baseapp`](../advanced-concepts/00-baseapp.md) 路由到适当的模块以进行处理。这种范式使开发人员能够轻松构建复杂的状态机，因为他们通常已经存在所需的大多数模块。**对于开发人员来说，构建 Cosmos SDK 应用程序所涉及的大部分工作都围绕着构建自定义模块，并将其与已经存在的模块集成到一个一致的应用程序中**。在应用程序目录中，通常的做法是将模块存储在 `x/` 文件夹中（不要与 Cosmos SDK 的 `x/` 文件夹混淆，后者包含已构建的模块）。
+
+### 应用程序模块接口
+
+模块必须实现 Cosmos SDK 中定义的[接口](../../integrate/building-modules/01-module-manager.md#application-module-interfaces)，[`AppModuleBasic`](../../integrate/building-modules/01-module-manager.md#appmodulebasic) 和 [`AppModule`](../../integrate/building-modules/01-module-manager.md#appmodule)。前者实现模块的基本非依赖元素，如 `codec`，而后者处理模块方法的大部分内容（包括需要引用其他模块的 `keeper` 的方法）。`AppModule` 和 `AppModuleBasic` 类型通常在一个名为 `module.go` 的文件中定义。
+
+`AppModule` 在模块上公开了一系列有用的方法，以便将模块组合成一个一致的应用程序。这些方法是从[`模块管理器`](../../integrate/building-modules/01-module-manager.md#manager)中调用的，该管理器管理应用程序的模块集合。
+
+### `Msg` 服务
+
+每个应用模块都定义了两个 [Protobuf 服务](https://developers.google.com/protocol-buffers/docs/proto#services)：一个 `Msg` 服务用于处理消息，一个 gRPC `Query` 服务用于处理查询。如果我们将模块视为状态机，那么 `Msg` 服务就是一组状态转换的 RPC 方法。
+每个 Protobuf `Msg` 服务方法与一个 Protobuf 请求类型是一对一关联的，该请求类型必须实现 `sdk.Msg` 接口。
+请注意，`sdk.Msg` 被捆绑在 [交易](../advanced-concepts/01-transactions.md) 中，每个交易包含一个或多个消息。
+
+当一个有效的交易块被全节点接收到时，CometBFT 通过 [`DeliverTx`](https://docs.cometbft.com/v0.37/spec/abci/abci++_app_requirements#specifics-of-responsedelivertx) 将每个交易中继给应用程序。然后，应用程序处理该交易：
+
+1. 在接收到交易后，应用程序首先将其从 `[]byte` 反序列化。
+2. 然后，在提取交易中包含的 `Msg` 之前，它会验证交易的一些内容，如[费用支付和签名](04-gas-fees.md#antehandler)。
+3. `sdk.Msg` 使用 Protobuf 的 [`Any`](#register-codec) 进行编码。通过分析每个 `Any` 的 `type_url`，baseapp 的 `msgServiceRouter` 将 `sdk.Msg` 路由到相应模块的 `Msg` 服务。
+4. 如果消息成功处理，状态将被更新。
+
+更多详细信息，请参阅[交易生命周期](01-tx-lifecycle.md)。
+
+当模块开发者构建自己的模块时，他们会创建自定义的 `Msg` 服务。通常的做法是在 `tx.proto` 文件中定义 `Msg` Protobuf 服务。例如，`x/bank` 模块定义了一个包含两个方法用于转移代币的服务：
+
+```protobuf reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/proto/cosmos/bank/v1beta1/tx.proto#L13-L36
+```
+
+服务方法使用 `keeper` 来更新模块状态。
+
+每个模块还应该作为 [`AppModule` 接口](#application-module-interface) 的一部分实现 `RegisterServices` 方法。该方法应该调用由生成的 Protobuf 代码提供的 `RegisterMsgServer` 函数。
+
+### gRPC `Query` 服务
+
+gRPC `Query` 服务允许用户使用 [gRPC](https://grpc.io) 查询状态。它们默认启用，并且可以在 [`app.toml`](../../user/run-node/02-interact-node.md#configuring-the-node-using-apptoml) 文件的 `grpc.enable` 和 `grpc.address` 字段下进行配置。
+
+gRPC `Query` 服务在模块的 Protobuf 定义文件中定义，具体位于 `query.proto` 文件中。`query.proto` 定义文件公开了一个 `Query` [Protobuf 服务](https://developers.google.com/protocol-buffers/docs/proto#services)。每个 gRPC 查询端点对应于 `Query` 服务中以 `rpc` 关键字开头的服务方法。
+
+Protobuf 为每个模块生成了一个 `QueryServer` 接口，其中包含了所有的服务方法。然后，模块的 [`keeper`](#keeper) 需要实现这个 `QueryServer` 接口，通过提供每个服务方法的具体实现来完成。这个具体实现是相应 gRPC 查询端点的处理程序。
+
+最后，每个模块还应该作为 [`AppModule` 接口](#application-module-interface) 的一部分实现 `RegisterServices` 方法。这个方法应该调用由生成的 Protobuf 代码提供的 `RegisterQueryServer` 函数。
+
+### Keeper
+
+[`Keepers`](../../integrate/building-modules/06-keeper.md) 是其模块存储的守门人。要在模块的存储中读取或写入数据，必须通过其 `keeper` 的方法。这是由 Cosmos SDK 的 [对象能力](../advanced-concepts/10-ocap.md) 模型来确保的。只有持有存储键的对象才能访问它，而且只有模块的 `keeper` 应该持有模块存储的键。
+
+`Keepers` 通常在一个名为 `keeper.go` 的文件中定义。它包含了 `keeper` 的类型定义和方法。
+
+`keeper` 的类型定义通常包括以下内容：
+
+* 模块在多存储中的存储键。
+* 对其他模块 `keeper` 的引用。只有在 `keeper` 需要访问其他模块的存储（读取或写入）时才需要。
+* 对应用程序的编解码器的引用。`keeper` 需要它在存储之前对结构进行编组，或者在检索结构时对其进行解组，因为存储只接受 `[]bytes` 作为值。
+
+除了类型定义之外，`keeper.go` 文件的下一个重要组件是 `keeper` 的构造函数 `NewKeeper`。该函数使用一个 `codec` 实例化一个新的与上述类型相匹配的 `keeper`，并将 `keys` 存储起来，可能还会引用其他模块的 `keeper`。`NewKeeper` 函数是从[应用程序的构造函数](#constructor-function)中调用的。文件的其余部分定义了 `keeper` 的方法，主要是 getter 和 setter。
+
+### 命令行、gRPC 服务和 REST 接口
+
+每个模块都定义了命令行命令、gRPC 服务和 REST 路由，以通过[应用程序接口](#application-interfacev)向最终用户公开。这使得最终用户可以创建在模块中定义的消息类型，或者查询由模块管理的状态的子集。
+
+#### CLI
+
+通常，[与模块相关的命令](../../integrate/building-modules/09-module-interfaces.md#cli)在模块文件夹中的 `client/cli` 文件夹中定义。CLI 将命令分为两类，事务和查询，分别在 `client/cli/tx.go` 和 `client/cli/query.go` 中定义。这两个命令都是基于 [Cobra 库](https://github.com/spf13/cobra) 构建的：
+
+* 事务命令允许用户生成新的事务，以便可以将其包含在块中并最终更新状态。每个在模块中定义的命令都应创建一个命令。该命令使用最终用户提供的参数调用消息的构造函数，并将其包装成一个事务。Cosmos SDK 处理签名和其他事务元数据的添加。
+* 查询允许用户查询由模块定义的状态子集。查询命令将查询转发到[应用程序的查询路由器](../advanced-concepts/00-baseapp.md#query-routing)，该路由器将其路由到相应的 `queryRoute` 参数。
+
+#### gRPC
+
+[gRPC](https://grpc.io) 是一个现代的开源高性能 RPC 框架，支持多种语言。它是外部客户端（如钱包、浏览器和其他后端服务）与节点交互的推荐方式。
+
+每个模块都可以暴露称为[服务方法](https://grpc.io/docs/what-is-grpc/core-concepts/#service-definition)的gRPC端点，这些方法在[模块的Protobuf `query.proto`文件](#grpc-query-services)中定义。服务方法由其名称、输入参数和输出响应来定义。然后，模块需要执行以下操作：
+
+* 在`AppModuleBasic`上定义一个`RegisterGRPCGatewayRoutes`方法，将客户端gRPC请求连接到模块内的正确处理程序。
+* 对于每个服务方法，定义一个相应的处理程序。处理程序实现了为提供gRPC请求所必需的核心逻辑，并位于`keeper/grpc_query.go`文件中。
+
+#### gRPC-gateway REST端点
+
+某些外部客户端可能不希望使用gRPC。在这种情况下，Cosmos SDK提供了一个gRPC网关服务，将每个gRPC服务公开为相应的REST端点。请参阅[grpc-gateway](https://grpc-ecosystem.github.io/grpc-gateway/)文档以了解更多信息。
+
+REST端点在Protobuf文件中与gRPC服务一起使用Protobuf注释进行定义。希望公开REST查询的模块应向其`rpc`方法添加`google.api.http`注释。默认情况下，SDK中定义的所有REST端点的URL都以`/cosmos/`前缀开头。
+
+Cosmos SDK还提供了一个开发端点，用于为这些REST端点生成[Swagger](https://swagger.io/)定义文件。可以在[`app.toml`](../../user/run-node/01-run-node.md#configuring-the-node-using-apptoml)配置文件中的`api.swagger`键下启用此端点。
+
+## 应用程序接口
+
+[接口](#command-line-grpc-services-and-rest-interfaces)允许最终用户与全节点客户端进行交互。这意味着从全节点查询数据或创建和发送新的交易以由全节点中继，并最终包含在一个区块中。
+
+主要接口是[命令行界面](../advanced-concepts/07-cli.md)。Cosmos SDK应用程序的CLI是通过聚合应用程序使用的每个模块中定义的[CLI命令](#cli)来构建的。应用程序的CLI与守护程序（例如`appd`）相同，并在一个名为`appd/main.go`的文件中定义。该文件包含以下内容：
+
+* **一个 `main()` 函数**，用于构建 `appd` 接口客户端。该函数在构建命令之前准备每个命令并将其添加到 `rootCmd` 中。在 `appd` 的根目录下，该函数添加了通用命令，如 `status`、`keys` 和 `config`，查询命令，交易命令和 `rest-server`。
+* **查询命令**，通过调用 `queryCmd` 函数添加。该函数返回一个 Cobra 命令，其中包含在应用程序的每个模块中定义的查询命令（作为 `main()` 函数中的 `sdk.ModuleClients` 数组传递），以及一些其他较低级别的查询命令，如块或验证器查询。通过使用 CLI 的命令 `appd query [query]` 来调用查询命令。
+* **交易命令**，通过调用 `txCmd` 函数添加。与 `queryCmd` 类似，该函数返回一个 Cobra 命令，其中包含在应用程序的每个模块中定义的交易命令，以及较低级别的交易命令，如交易签名或广播。通过使用 CLI 的命令 `appd tx [tx]` 来调用交易命令。
+
+请参阅来自 [Cosmos Hub](https://github.com/cosmos/gaia) 的应用程序主命令行文件的示例。
+
+```go reference
+https://github.com/cosmos/gaia/blob/26ae7c2/cmd/gaiad/cmd/root.go#L39-L80
+```
+
+## 依赖和 Makefile
+
+此部分是可选的，因为开发人员可以自由选择其依赖管理器和项目构建方法。尽管如此，当前最常用的版本控制框架是 [`go.mod`](https://github.com/golang/go/wiki/Modules)。它确保应用程序中使用的每个库都以正确的版本导入。
+
+以下是 [Cosmos Hub](https://github.com/cosmos/gaia) 的 `go.mod`，供参考。
+
+```go reference
+https://github.com/cosmos/gaia/blob/26ae7c2/go.mod#L1-L28
+```
+
+通常使用 [Makefile](https://en.wikipedia.org/wiki/Makefile) 来构建应用程序。Makefile 主要确保在构建应用程序的两个入口点 [`appd`](#node-client) 和 [`appd`](#application-interface) 之前运行 `go.mod`。
+
+这是[Cosmos Hub Makefile](https://github.com/cosmos/gaia/blob/main/Makefile)的示例。
+
+
 # Overview of a  Cosmos SDK Application
 
 :::note Synopsis

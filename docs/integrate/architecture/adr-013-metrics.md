@@ -1,3 +1,149 @@
+# ADR 013: 可观测性
+
+## 变更日志
+
+* 2020年1月20日：初稿
+
+## 状态
+
+建议中
+
+## 背景
+
+遥测对于调试和理解应用程序的运行和性能至关重要。我们的目标是从模块和Cosmos SDK的其他核心部分公开指标。
+
+此外，我们应该支持多个可配置的接收器，供操作员选择。默认情况下，当启用遥测时，应用程序应该跟踪和公开存储在内存中的指标。操作员可以选择启用其他接收器，目前我们仅支持[Prometheus](https://prometheus.io/)，因为它经过了实战检验，设置简单，开源，并且具有丰富的生态工具。
+
+我们还必须以最无缝的方式将指标集成到Cosmos SDK中，以便可以随意添加或删除指标而不会遇到太多阻力。为此，我们将使用[go-metrics](https://github.com/armon/go-metrics)库。
+
+最后，操作员可以在特定的配置选项中启用遥测。如果启用，指标将通过API服务器的`/metrics?format={text|prometheus}`公开。
+
+## 决策
+
+我们将在`app.toml`中添加一个额外的配置块，用于定义遥测设置：
+
+```toml
+###############################################################################
+###                         Telemetry Configuration                         ###
+###############################################################################
+
+[telemetry]
+
+# Prefixed with keys to separate services
+service-name = {{ .Telemetry.ServiceName }}
+
+# Enabled enables the application telemetry functionality. When enabled,
+# an in-memory sink is also enabled by default. Operators may also enabled
+# other sinks such as Prometheus.
+enabled = {{ .Telemetry.Enabled }}
+
+# Enable prefixing gauge values with hostname
+enable-hostname = {{ .Telemetry.EnableHostname }}
+
+# Enable adding hostname to labels
+enable-hostname-label = {{ .Telemetry.EnableHostnameLabel }}
+
+# Enable adding service to labels
+enable-service-label = {{ .Telemetry.EnableServiceLabel }}
+
+# PrometheusRetentionTime, when positive, enables a Prometheus metrics sink.
+prometheus-retention-time = {{ .Telemetry.PrometheusRetentionTime }}
+```
+
+给定的配置允许两个接收器--内存和Prometheus。我们创建一个`Metrics`类型，它执行操作员的所有引导工作，从而使捕获指标变得无缝。
+
+```go
+// Metrics defines a wrapper around application telemetry functionality. It allows
+// metrics to be gathered at any point in time. When creating a Metrics object,
+// internally, a global metrics is registered with a set of sinks as configured
+// by the operator. In addition to the sinks, when a process gets a SIGUSR1, a
+// dump of formatted recent metrics will be sent to STDERR.
+type Metrics struct {
+  memSink           *metrics.InmemSink
+  prometheusEnabled bool
+}
+
+// Gather collects all registered metrics and returns a GatherResponse where the
+// metrics are encoded depending on the type. Metrics are either encoded via
+// Prometheus or JSON if in-memory.
+func (m *Metrics) Gather(format string) (GatherResponse, error) {
+  switch format {
+  case FormatPrometheus:
+    return m.gatherPrometheus()
+
+  case FormatText:
+    return m.gatherGeneric()
+
+  case FormatDefault:
+    return m.gatherGeneric()
+
+  default:
+    return GatherResponse{}, fmt.Errorf("unsupported metrics format: %s", format)
+  }
+}
+```
+
+此外，`Metrics`允许我们在任何给定时间点收集当前的指标集。操作员还可以选择发送一个信号SIGUSR1，将格式化的指标转储和打印到STDERR。
+
+在应用程序的引导和构建阶段，如果`Telemetry.Enabled`为`true`，API服务器将创建一个对`Metrics`对象的引用实例，并相应地注册一个指标处理程序。
+
+```go
+func (s *Server) Start(cfg config.Config) error {
+  // ...
+
+  if cfg.Telemetry.Enabled {
+    m, err := telemetry.New(cfg.Telemetry)
+    if err != nil {
+      return err
+    }
+
+    s.metrics = m
+    s.registerMetrics()
+  }
+
+  // ...
+}
+
+func (s *Server) registerMetrics() {
+  metricsHandler := func(w http.ResponseWriter, r *http.Request) {
+    format := strings.TrimSpace(r.FormValue("format"))
+
+    gr, err := s.metrics.Gather(format)
+    if err != nil {
+      rest.WriteErrorResponse(w, http.StatusBadRequest, fmt.Sprintf("failed to gather metrics: %s", err))
+      return
+    }
+
+    w.Header().Set("Content-Type", gr.ContentType)
+    _, _ = w.Write(gr.Metrics)
+  }
+
+  s.Router.HandleFunc("/metrics", metricsHandler).Methods("GET")
+}
+```
+
+应用程序开发人员可以跟踪计数器、仪表、摘要和键/值指标。模块无需进行额外的工作即可利用性能分析指标。只需简单地：
+
+```go
+func (k BaseKeeper) MintCoins(ctx sdk.Context, moduleName string, amt sdk.Coins) error {
+  defer metrics.MeasureSince(time.Now(), "MintCoins")
+  // ...
+}
+```
+
+## 结果
+
+### 积极的
+
+* 对应用程序的性能和行为有更多了解
+
+### 消极的
+
+### 中性的
+
+## 参考资料
+
+
 # ADR 013: Observability
 
 ## Changelog

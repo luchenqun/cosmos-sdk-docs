@@ -1,3 +1,58 @@
+# 查询服务
+
+:::note 概述
+Protobuf 查询服务处理 [`queries`](02-messages-and-queries.md#queries)。查询服务特定于定义它们的模块，并且仅处理在该模块中定义的 `queries`。它们从 `BaseApp` 的 [`Query` 方法](../../develop/advanced-concepts/00-baseapp.md#query) 中调用。
+:::
+
+:::note
+
+### 先决条件阅读
+
+* [模块管理器](01-module-manager.md)
+* [消息和查询](02-messages-and-queries.md)
+
+:::
+
+## 模块查询服务的实现
+
+### gRPC 服务
+
+在定义 Protobuf `Query` 服务时，为每个模块生成一个 `QueryServer` 接口，其中包含所有服务方法：
+
+```go
+type QueryServer interface {
+	QueryBalance(context.Context, *QueryBalanceParams) (*types.Coin, error)
+	QueryAllBalances(context.Context, *QueryAllBalancesParams) (*QueryAllBalancesResponse, error)
+}
+```
+
+这些自定义查询方法应该由模块的 keeper 在 `./keeper/grpc_query.go` 中实现。这些方法的第一个参数是一个通用的 `context.Context`。因此，Cosmos SDK 提供了一个函数 `sdk.UnwrapSDKContext` 来从提供的 `context.Context` 中检索 `sdk.Context`。
+
+以下是银行模块的示例实现：
+
+```go reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/x/bank/keeper/grpc_query.go
+```
+
+### 从状态机调用查询
+
+Cosmos SDK v0.47 引入了一个新的 `cosmos.query.v1.module_query_safe` Protobuf 注解，用于声明一个可以从状态机内部调用的查询，例如：
+
+* 可以从另一个模块的 Keeper 调用 Keeper 的查询函数，
+* ADR-033 模块间查询调用，
+* CosmWasm 合约也可以直接与这些查询交互。
+
+如果 `module_query_safe` 注解设置为 `true`，则表示：
+
+* 查询是确定性的：给定一个块高度，它将在多次调用时返回相同的响应，并且不会在 SDK 补丁版本之间引入任何破坏状态机的更改。
+* 气体消耗在调用和补丁版本之间不会波动。
+
+如果您是模块开发人员，并希望为自己的查询使用 `module_query_safe` 注解，您必须确保以下事项：
+
+* 查询是确定性的，并且不会在没有协调升级的情况下引入破坏状态机的更改。
+* 它跟踪其燃气，以避免在可能进行高计算查询时未计算燃气的攻击向量。
+
+
 
 
 # Query Services

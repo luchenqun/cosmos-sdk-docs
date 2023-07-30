@@ -1,3 +1,90 @@
+# `x/nft`
+
+## 内容
+
+## 摘要
+
+`x/nft` 是 Cosmos SDK 模块的实现，根据 [ADR 43](https://github.com/cosmos/cosmos-sdk/blob/main/docs/architecture/adr-043-nft-module.md)，它允许您创建 NFT 分类、创建 NFT、转移 NFT、更新 NFT，并通过集成该模块支持各种查询。它与 ERC721 规范完全兼容。
+
+* [概念](#概念)
+    * [分类](#分类)
+    * [NFT](#nft)
+* [状态](#状态)
+    * [分类](#分类-1)
+    * [NFT](#nft-1)
+    * [按所有者分类的 NFT](#按所有者分类的-nft)
+    * [所有者](#所有者)
+    * [总供应量](#总供应量)
+* [消息](#消息)
+    * [MsgSend](#msgsend)
+* [事件](#事件)
+
+## 概念
+
+### 分类
+
+`x/nft` 模块定义了一个结构体 `分类`，用于描述一类 NFT 的共同特征，在这个分类下，您可以创建各种 NFT，相当于以太坊的 ERC721 合约。该设计在 [ADR 043](https://github.com/cosmos/cosmos-sdk/blob/main/docs/architecture/adr-043-nft-module.md) 中定义。
+
+### NFT
+
+NFT 的全称是不可替代代币（Non-Fungible Tokens）。由于 NFT 的不可替代性，它可以用来代表独特的事物。该模块实现的 NFT 与以太坊的 ERC721 标准完全兼容。
+
+## 状态
+
+### 分类
+
+分类主要由 `id`、`name`、`symbol`、`description`、`uri`、`uri_hash` 和 `data` 组成，其中 `id` 是分类的唯一标识符，类似于以太坊的 ERC721 合约地址，其他字段是可选的。
+
+* 分类：`0x01 | classID | -> ProtocolBuffer(Class)`
+
+### NFT
+
+NFT 主要由 `class_id`、`id`、`uri`、`uri_hash` 和 `data` 组成。其中，`class_id` 和 `id` 是用于标识 NFT 唯一性的二元组，`uri` 和 `uri_hash` 是可选的，用于标识 NFT 的链外存储位置，`data` 是 Any 类型。通过扩展此字段，可以使用 `x/nft` 模块的 Any 链进行自定义。
+
+* NFT：`0x02 | classID | 0x00 | nftID |-> ProtocolBuffer(NFT)`
+
+### 按所有者分类的 NFT
+
+按所有者分类的 NFT 主要实现了使用 classID 和所有者查询所有 NFT 的功能，没有其他多余的功能。
+
+* NFTOfClassByOwner: `0x03 | owner | 0x00 | classID | 0x00 | nftID |-> 0x01`
+
+### 所有者
+
+由于 NFT 中没有额外的字段来指示 NFT 的所有者，因此使用额外的键值对来保存 NFT 的所有权。随着 NFT 的转移，键值对会同步更新。
+
+* OwnerKey: `0x04 | classID | 0x00  | nftID |-> owner`
+
+### 总供应量
+
+总供应量负责跟踪特定类别下所有 NFT 的数量。在更改类别下进行铸造操作时，供应量增加一，进行销毁操作时，供应量减少一。
+
+* OwnerKey: `0x05 | classID |-> totalSupply`
+
+## 消息
+
+在本节中，我们描述了 NFT 模块的消息处理。
+
+:::warning
+`ClassID` 和 `NftID` 的验证由应用程序开发人员负责。  
+SDK 不对这些字段进行任何验证。
+:::
+
+### MsgSend
+
+您可以使用 `MsgSend` 消息来转移 NFT 的所有权。这是 `x/nft` 模块提供的一个功能。当然，您也可以使用 `Transfer` 方法来实现自己的转移逻辑，但是需要额外注意转移权限。
+
+如果出现以下情况，消息处理应该失败：
+
+* 提供的 `ClassID` 不存在。
+* 提供的 `Id` 不存在。
+* 提供的 `Sender` 不是 NFT 的所有者。
+
+## 事件
+
+NFT 模块发出的 proto 事件在 [Protobuf 参考文档](https://buf.build/cosmos/cosmos-sdk/docs/main:cosmos.nft.v1beta1) 中定义。
+
+
 
 
 # `x/nft`

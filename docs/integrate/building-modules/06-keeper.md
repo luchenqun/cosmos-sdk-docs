@@ -1,3 +1,95 @@
+# Keepers
+
+:::note 概述
+`Keeper` 是 Cosmos SDK 中的一个抽象概念，其作用是管理各个模块定义的状态子集的访问。`Keeper` 是模块特定的，也就是说，只有在该模块中定义的 `keeper` 才能访问该模块定义的状态子集。如果一个模块需要访问另一个模块定义的状态子集，需要将对第二个模块内部 `keeper` 的引用传递给第一个模块。这是在 `app.go` 中在实例化模块 `keeper` 时完成的。
+:::
+
+:::note
+
+### 先决条件阅读
+
+* [Cosmos SDK 模块介绍](00-intro.md)
+
+:::
+
+## 动机
+
+Cosmos SDK 是一个框架，使开发人员能够从头开始构建复杂的去中心化应用程序，主要通过组合模块来实现。随着 Cosmos SDK 的开源模块生态系统的扩大，越来越有可能出现一些模块包含漏洞的情况，这是由于开发人员的疏忽或恶意导致的。
+
+Cosmos SDK 采用了一种基于[对象能力的方法](../../develop/advanced-concepts/10-ocap.md)，以帮助开发人员更好地保护他们的应用程序免受不需要的模块间交互的影响，而 `keeper` 是这种方法的核心。可以将 `keeper` 理解为模块存储的门卫。每个模块内定义的存储（通常是 [`IAVL` 存储](../../develop/advanced-concepts/04-store.md#iavl-store)）都有一个 `storeKey`，它可以无限制地访问该存储。模块的 `keeper` 持有这个 `storeKey`（否则应该保持不公开），并定义了[方法](#implementing-methods)来读写存储。
+
+对象能力方法的核心思想是只透露完成工作所必需的内容。在实践中，这意味着不通过访问控制列表来处理模块的权限，而是将模块 `keeper` 传递给它们需要访问的其他模块 `keeper` 的特定实例的引用（这是在[应用程序的构造函数](../../develop/high-level-concepts/00-overview-app.md#constructor-function)中完成的）。因此，一个模块只能通过其他模块的 `keeper` 实例提供的方法与另一个模块定义的状态子集进行交互。这是开发人员控制自己的模块与外部开发人员开发的模块之间交互的一种很好的方式。
+
+## 类型定义
+
+`keeper` 通常在模块的文件夹中的 `/keeper/keeper.go` 文件中实现。按照惯例，模块的 `keeper` 类型简单地命名为 `Keeper`，并且通常遵循以下结构：
+
+```go
+type Keeper struct {
+    // External keepers, if any
+
+    // Store key(s)
+
+    // codec
+
+    // authority 
+}
+```
+
+例如，这是 `staking` 模块中 `keeper` 的类型定义：
+
+```go reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/x/staking/keeper/keeper.go#L23-L31
+```
+
+让我们逐个介绍不同的参数：
+
+* 预期的 `keeper` 是模块内部 `keeper` 所需的外部 `keeper`。外部 `keeper` 在内部 `keeper` 的类型定义中作为接口列出。这些接口本身在模块文件夹的根目录中的 `expected_keepers.go` 文件中定义。在这个上下文中，接口用于减少依赖的数量，并且便于模块本身的维护。
+* `storeKey` 授予对模块管理的 [multistore](../../develop/advanced-concepts/04-store.md) 存储的访问权限。它们应始终对外部模块保持未公开状态。
+* `cdc` 是用于将结构体编组和解组为 `[]byte` 的 [编解码器](../../develop/advanced-concepts/06-encoding.md)。`cdc` 可以是 `codec.BinaryCodec`、`codec.JSONCodec` 或 `codec.Codec` 中的任何一个，具体取决于您的需求。它可以是 proto 或 amino 编解码器，只要它们实现了这些接口。所列的权限是一个模块账户或用户账户，具有更改模块级参数的权限。以前，这是由 param 模块处理的，但已被弃用。
+
+当然，可以为同一个模块定义不同类型的内部 `keeper`（例如，只读 `keeper`）。每种类型的 `keeper` 都有自己的构造函数，该构造函数从[应用程序的构造函数](../../develop/high-level-concepts/00-overview-app.md)中调用。在这里，`keeper` 被实例化，并且开发人员确保将正确的模块 `keeper` 实例传递给其他需要它们的模块。
+
+## 实现方法
+
+`Keeper` 主要为其模块管理的存储提供了获取器和设置器方法。这些方法应尽可能简单，并且严格限制于获取或设置所请求的值，因为在调用 `keeper` 方法时，[`Msg` 服务器](03-msg-services.md) 应已执行了有效性检查。
+
+通常，*获取器* 方法将具有以下签名：
+
+```go
+func (k Keeper) Get(ctx sdk.Context, key string) returnType
+```
+
+该方法将按照以下步骤进行：
+
+1. 使用 `storeKey` 通过 `ctx` 的 `KVStore(storeKey sdk.StoreKey)` 方法从 `ctx` 中检索适当的存储。然后，最好使用 `prefix.Store` 仅访问所需的存储子集，以提高方便性和安全性。
+2. 如果存在，使用存储的 `Get(key []byte)` 方法获取存储在位置 `[]byte(key)` 处的 `[]byte` 值。
+3. 使用编解码器 `cdc` 将检索到的值从 `[]byte` 解组为 `returnType`。返回该值。
+
+类似地，*设置器* 方法将具有以下签名：
+
+```go
+func (k Keeper) Set(ctx sdk.Context, key string, value valueType)
+```
+
+该方法将按照以下步骤进行：
+
+1. 使用 `storeKey` 通过 `ctx` 的 `KVStore(storeKey sdk.StoreKey)` 方法从 `ctx` 中检索适当的存储。最好使用 `prefix.Store` 仅访问所需的存储子集，以提高方便性和安全性。
+2. 使用编解码器 `cdc` 将 `value` 编组为 `[]byte`。
+3. 使用存储的 `Set(key []byte, value []byte)` 方法，在存储的位置 `key` 处设置编码后的值。
+
+更多信息，请参阅 [`staking` 模块中 `keeper` 的方法实现示例](https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/x/staking/keeper/keeper.go)。
+
+[模块 `KVStore`](../../develop/advanced-concepts/04-store.md#kvstore-and-commitkvstore-interfaces) 还提供了一个 `Iterator()` 方法，用于返回一个 `Iterator` 对象，以迭代一组键。
+
+这是一个从`auth`模块迭代账户的示例：
+
+```go reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/x/auth/keeper/account.go#L94-L108
+```
+
+
+
 
 
 # Keepers

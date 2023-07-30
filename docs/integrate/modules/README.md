@@ -1,3 +1,42 @@
+# 模块概述
+
+以下是可用于 Cosmos SDK 应用程序的一些生产级模块，以及它们各自的文档：
+
+* [Auth](auth/README.md) - 用于 Cosmos SDK 应用程序的账户和交易的身份验证。
+* [Authz](authz/README.md) - 允许账户代表其他账户执行操作的授权。
+* [Bank](bank/README.md) - 代币转账功能。
+* [Crisis](crisis/README.md) - 在特定情况下（例如，不变量被破坏）停止区块链。
+* [Distribution](distribution/README.md) - 费用分配和质押代币供应分配。
+* [Evidence](evidence/README.md) - 处理双重签名、恶意行为等证据。
+* [Feegrant](feegrant/README.md) - 授予执行交易的费用津贴。
+* [Governance](gov/README.md) - 链上提案和投票。
+* [Mint](mint/README.md) - 创建新的质押代币单位。
+* [Params](params/README.md) - 全局可用的参数存储。
+* [Slashing](slashing/README.md) - 验证人惩罚机制。
+* [Staking](staking/README.md) - 公共区块链的权益证明层。
+* [Upgrade](upgrade/README.md) - 软件升级处理和协调。
+* [NFT](nft/README.md) - 基于 [ADR43](https://docs.cosmos.network/main/architecture/adr-043-nft-module.html) 实现的 NFT 模块。
+* [Consensus](consensus/README.md) - 修改 CometBFT 的 ABCI 共识参数的共识模块。
+* [Circuit](circuit/README.md) - 用于暂停消息的断路器模块。
+* [Genutil](genutil/README.md) - 用于 Cosmos SDK 的创世工具。
+
+要了解有关构建模块的过程的更多信息，请访问[构建模块参考文档](https://docs.cosmos.network/main/building-modules/intro)。
+
+## IBC
+
+SDK 的 IBC 模块由 IBC Go 团队在其[独立存储库](https://github.com/cosmos/ibc-go)中维护。
+
+此外，[capability 模块](https://github.com/cosmos/ibc-go/tree/fdd664698d79864f1e00e147f9879e58497b5ef1/modules/capability)从 v0.48+ 开始由 IBC Go 团队在其[独立存储库](https://github.com/cosmos/ibc-go/tree/fdd664698d79864f1e00e147f9879e58497b5ef1/modules/capability)中维护。
+
+## CosmWasm
+
+CosmWasm模块使智能合约成为可能，了解更多信息请访问他们的[文档网站](https://book.cosmwasm.com/)，或者访问[代码库](https://github.com/CosmWasm/cosmwasm)。
+
+## EVM
+
+在官方的[`evm`文档页面](https://docs.evmos.org/modules/evm/)上了解更多关于使用solidity编写智能合约的信息。
+
+
 # Module Summary
 
 Here are some production-grade modules that can be used in Cosmos SDK applications, along with their respective documentation:

@@ -1,3 +1,122 @@
+# `Msg` 服务
+
+:::note 概述
+Protobuf `Msg` 服务处理 [消息](02-messages-and-queries.md#messages)。Protobuf `Msg` 服务特定于定义它们的模块，并且仅处理在该模块内定义的消息。它们在 [`DeliverTx`](../../develop/advanced-concepts/00-baseapp.md#delivertx) 中由 `BaseApp` 调用。
+:::
+
+:::note
+
+### 先决条件阅读
+
+* [模块管理器](01-module-manager.md)
+* [消息和查询](02-messages-and-queries.md)
+
+:::
+
+## 模块 `Msg` 服务的实现
+
+每个模块应该定义一个 Protobuf `Msg` 服务，负责处理请求（实现 `sdk.Msg`）并返回响应。
+
+如 [ADR 031](../architecture/adr-031-msg-service.md) 中进一步描述的那样，这种方法的优点是明确指定返回类型并生成服务器和客户端代码。
+
+Protobuf 根据 `Msg` 服务的定义生成 `MsgServer` 接口。模块开发者的角色是实现此接口，通过实现在接收到每个 `sdk.Msg` 时应发生的状态转换逻辑。以下是 `x/bank` 生成的 `MsgServer` 接口示例，它公开了两个 `sdk.Msg`：
+
+```go reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/x/bank/types/tx.pb.go#L550-L568
+```
+
+在可能的情况下，现有模块的 [`Keeper`](06-keeper.md) 应该实现 `MsgServer`，否则可以创建一个嵌入 `Keeper` 的 `msgServer` 结构体，通常位于 `./keeper/msg_server.go`：
+
+```go reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/x/bank/keeper/msg_server.go#L15-L17
+```
+
+`msgServer` 方法可以使用 `sdk.UnwrapSDKContext` 从 `context.Context` 参数方法中检索 `sdk.Context`：
+
+```go reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/x/bank/keeper/msg_server.go#L28
+```
+
+`sdk.Msg` 的处理通常遵循以下 3 个步骤：
+
+### 验证
+
+消息服务器必须执行所有所需的验证（包括 *有状态* 和 *无状态*）以确保 `message` 是有效的。
+`signer` 负责此验证的燃料成本。
+
+例如，对于`transfer`消息，`msgServer`方法应该检查发送账户是否有足够的资金来执行转账。
+
+建议将所有验证检查都实现在一个单独的函数中，该函数将状态值作为参数传递。这种实现简化了测试。如预期的那样，昂贵的验证函数会额外收取gas。示例：
+
+```go
+ValidateMsgA(msg MsgA, now Time, gm GasMeter) error {
+	if now.Before(msg.Expire) {
+		return sdkerrrors.ErrInvalidRequest.Wrap("msg expired")
+	}
+	gm.ConsumeGas(1000, "signature verification")
+	return signatureVerificaton(msg.Prover, msg.Data)
+}
+```
+
+:::warning
+以前，使用`ValidateBasic`方法执行简单且无状态的验证检查。
+这种验证方式已被弃用，这意味着`msgServer`必须执行所有验证检查。
+:::
+
+### 状态转换
+
+在验证成功后，`msgServer`方法使用[`keeper`](06-keeper.md)函数访问状态并执行状态转换。
+
+### 事件
+
+在返回之前，`msgServer`方法通常通过使用`ctx`中保存的`EventManager`来发出一个或多个[事件](../../develop/advanced-concepts/08-events.md)。使用基于protobuf的事件类型的新`EmitTypedEvent`函数：
+
+```go
+ctx.EventManager().EmitTypedEvent(
+	&group.EventABC{Key1: Value1,  Key2, Value2})
+```
+
+或者使用旧的`EmitEvent`函数：
+
+```go
+ctx.EventManager().EmitEvent(
+	sdk.NewEvent(
+		eventType,  // e.g. sdk.EventTypeMessage for a message, types.CustomEventType for a custom event defined in the module
+		sdk.NewAttribute(key1, value1),
+		sdk.NewAttribute(key2, value2),
+	),
+)
+```
+
+这些事件被传递回底层共识引擎，并可由服务提供者用于实现应用程序周围的服务。点击[这里](../../develop/advanced-concepts/08-events.md)了解更多关于事件的信息。
+
+调用的`msgServer`方法返回一个`proto.Message`响应和一个`error`。然后，将这些返回值使用`sdk.WrapServiceResult(ctx sdk.Context, res proto.Message, err error)`封装为`*sdk.Result`或`error`：
+
+```go reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/baseapp/msg_service_router.go#L131
+```
+
+该方法负责将`res`参数编组为protobuf，并将`ctx.EventManager()`上的任何事件附加到`sdk.Result`上。 
+
+```protobuf reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/proto/cosmos/base/abci/v1beta1/abci.proto#L88-L109
+```
+
+这个图示展示了一个典型的 Protobuf `Msg` 服务的结构，以及消息在模块中的传播方式。
+
+![交易流程](https://raw.githubusercontent.com/cosmos/cosmos-sdk/release/v0.46.x/docs/uml/svg/transaction_flow.svg)
+
+## 遥测
+
+当处理消息时，可以从 `msgServer` 方法中创建新的[遥测指标](../../develop/advanced-concepts/11-telemetry.md)。
+
+以下是 `x/auth/vesting` 模块的一个示例：
+
+```go reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/x/auth/vesting/msg_server.go#L68-L80
+```
+
+
 
 
 # `Msg` Services

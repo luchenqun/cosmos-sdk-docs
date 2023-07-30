@@ -1,3 +1,130 @@
+# ADR 016: 验证人共识密钥轮换
+
+## 更新日志
+
+* 2019年10月23日：初稿
+* 2019年11月28日：添加密钥轮换费用
+
+## 背景
+
+验证人共识密钥轮换功能已经讨论和请求了很长时间，为了更安全的验证人密钥管理策略（例如：https://github.com/tendermint/tendermint/issues/1136）。因此，我们建议在Cosmos SDK上实现验证人共识密钥轮换的最简形式。
+
+我们不需要在Tendermint的共识逻辑上进行任何更新，因为Tendermint没有任何映射共识密钥和验证人操作密钥的信息，这意味着从Tendermint的角度来看，验证人的共识密钥轮换只是将一个共识密钥替换为另一个。
+
+此外，需要注意的是，本ADR仅包括最简形式的共识密钥轮换，不考虑多个共识密钥的概念。这种多个共识密钥的概念应该作为Tendermint和Cosmos SDK的长期目标。
+
+## 决策
+
+### 共识密钥轮换的伪过程
+
+* 创建新的随机共识密钥。
+* 创建并广播一笔交易，其中包含一个`MsgRotateConsPubKey`，声明新的共识密钥现在与验证人操作密钥配对，并由验证人的操作密钥签名。
+* 在链上更新密钥映射状态后，旧的共识密钥立即无法参与共识。
+* 使用新的共识密钥进行验证。
+* 使用HSM和KMS的验证人应该在高度`h`之后更新HSM中的共识密钥，以使用新的轮换密钥，此时`MsgRotateConsPubKey`已经提交到区块链。
+
+### 考虑因素
+
+* 共识密钥映射信息管理策略
+    * 在kvstore中存储每个密钥映射更改的历史记录。
+    * 状态机可以在最近的解绑期内搜索与给定验证人操作密钥配对的相应共识密钥，以任意高度。
+    * 状态机不需要任何超过解绑期的历史映射信息。
+* 与LCD和IBC相关的密钥轮换成本
+    * 当存在频繁的权力更改时，LCD和IBC将承担流量/计算负担。
+    * 在当前的Tendermint设计中，共识密钥轮换被视为来自LCD或IBC的权力更改。
+    * 因此，为了最小化不必要的频繁密钥轮换行为，我们限制了最近解绑期内的最大轮换次数，并且应用了指数增加的轮换费用。
+* 限制
+    * 验证人在任何解绑期内不能轮换其共识密钥超过`MaxConsPubKeyRotations`次，以防止垃圾邮件。
+    * 参数可以由治理决定并存储在创世文件中。
+* 密钥轮换费用
+    * 验证人应支付`KeyRotationFee`来轮换共识密钥，计算如下
+    * `KeyRotationFee` = (max(`VotingPowerPercentage` *100, 1)* `InitialKeyRotationFee`) * 2^(最近解绑期内`ConsPubKeyRotationHistory`中的轮换次数)
+* 证据模块
+    * 证据模块可以通过惩罚保管者从任意高度搜索相应的共识密钥，以便决定给定高度应该使用哪个共识密钥。
+* abci.ValidatorUpdate
+    * Tendermint已经通过ABCI通信（`ValidatorUpdate`）具备更改共识密钥的能力。
+    * 验证人共识密钥的更新可以通过创建新的+删除旧的，将权力更改为零来完成。
+    * 因此，我们预计实现此功能时甚至不需要改变Tendermint的代码库。
+* `staking`模块中的新创世参数
+    * `MaxConsPubKeyRotations`：验证人在最近解绑期内可以执行的最大轮换次数。建议默认值为10（第11次密钥轮换将被拒绝）。
+    * `InitialKeyRotationFee`：在最近解绑期内没有发生密钥轮换时的初始密钥轮换费用。建议默认值为1atom（最近解绑期内第一次密钥轮换的1atom费用）。
+
+### 工作流程
+
+1. 验证器生成一个新的共识密钥对。
+2. 验证器使用其操作员密钥和新的ConsPubKey生成并签署`MsgRotateConsPubKey`交易。
+
+    ```go
+    type MsgRotateConsPubKey struct {
+        ValidatorAddress  sdk.ValAddress
+        NewPubKey         crypto.PubKey
+    }
+    ```
+
+3. `handleMsgRotateConsPubKey`接收`MsgRotateConsPubKey`，调用`RotateConsPubKey`并触发事件。
+4. `RotateConsPubKey`执行以下操作：
+    * 检查`ValidatorsByConsAddr`上是否存在重复的`NewPubKey`。
+    * 通过迭代`ConsPubKeyRotationHistory`检查验证器是否超过参数`MaxConsPubKeyRotations`。
+    * 检查签名账户是否有足够的余额支付`KeyRotationFee`。
+    * 将`KeyRotationFee`支付给社区基金。
+    * 在`validator.ConsPubKey`中覆盖`NewPubKey`。
+    * 删除旧的`ValidatorByConsAddr`。
+    * 为`NewPubKey`设置`SetValidatorByConsAddr`。
+    * 添加`ConsPubKeyRotationHistory`以跟踪密钥轮换。
+
+    ```go
+    type ConsPubKeyRotationHistory struct {
+        OperatorAddress         sdk.ValAddress
+        OldConsPubKey           crypto.PubKey
+        NewConsPubKey           crypto.PubKey
+        RotatedHeight           int64
+    }
+    ```
+
+5. `ApplyAndReturnValidatorSetUpdates`检查是否存在`ConsPubKeyRotationHistory`，并且`ConsPubKeyRotationHistory.RotatedHeight`等于`ctx.BlockHeight()`，如果是，则生成两个`ValidatorUpdate`，一个用于删除验证器，一个用于创建新的验证器。
+
+    ```go
+    abci.ValidatorUpdate{
+        PubKey: cmttypes.TM2PB.PubKey(OldConsPubKey),
+        Power:  0,
+    }
+
+    abci.ValidatorUpdate{
+        PubKey: cmttypes.TM2PB.PubKey(NewConsPubKey),
+        Power:  v.ConsensusPower(),
+    }
+    ```
+
+6. 在`AllocateTokens`的`previousVotes`迭代逻辑中，使用`OldConsPubKey`匹配`ConsPubKeyRotationHistory`，并替换令牌分配的验证器。
+7. 将`ValidatorSigningInfo`和`ValidatorMissedBlockBitArray`从`OldConsPubKey`迁移到`NewConsPubKey`。
+
+* 注意：以上所有功能应在`staking`模块中实现。
+
+## 状态
+
+提议中
+
+## 影响
+
+### 正面影响
+
+* 验证人可以立即或定期更换他们的共识密钥，以获得更好的安全策略
+* 在验证人丢弃旧的共识密钥后，可以提供更好的安全性，以防范长程攻击（https://nearprotocol.com/blog/long-range-attacks-and-a-new-fork-choice-rule）
+
+### 负面影响
+
+* Slash 模块需要更多计算，因为它需要查找每个高度的验证人对应的共识密钥
+* 频繁的密钥更换会使轻客户端二分法变得不那么高效
+
+### 中性影响
+
+## 参考资料
+
+* 在 tendermint 仓库上：https://github.com/tendermint/tendermint/issues/1136
+* 在 cosmos-sdk 仓库上：https://github.com/cosmos/cosmos-sdk/issues/5231
+* 关于多个共识密钥：https://github.com/tendermint/tendermint/issues/1758#issuecomment-545291698
+
+
 # ADR 016: Validator Consensus Key Rotation
 
 ## Changelog

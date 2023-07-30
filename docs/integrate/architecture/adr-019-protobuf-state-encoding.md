@@ -1,3 +1,285 @@
+# ADR 019: Protocol Buffer 状态编码
+
+## 更新日志
+
+* 2020年2月15日：初稿
+* 2020年2月24日：更新以处理带有接口字段的消息
+* 2020年4月27日：将接口的 `oneof` 用法转换为 `Any`
+* 2020年5月15日：描述 `cosmos_proto` 扩展和 amino 兼容性
+* 2020年12月4日：将 `MarshalAny` 和 `UnmarshalAny` 移动并重命名为 `codec.Codec` 接口中的方法
+* 2021年2月24日：删除对 `HybridCodec` 的提及，该功能已在 [#6843](https://github.com/cosmos/cosmos-sdk/pull/6843) 中被废弃。
+
+## 状态
+
+已接受
+
+## 背景
+
+目前，Cosmos SDK 在二进制和 JSON 对象编码上使用 [go-amino](https://github.com/tendermint/go-amino/)，以在逻辑对象和持久化对象之间实现一致性。
+
+根据 Amino 文档：
+
+> Amino 是一种对象编码规范。它是 Proto3 的一个子集，具有对接口的扩展支持。有关 Proto3 的更多信息，请参阅 [Proto3 规范](https://developers.google.com/protocol-buffers/docs/proto3)。Amino 在很大程度上与 Proto3 兼容（但与 Proto2 不兼容）。
+>
+> Amino 编码协议的目标是在逻辑对象和持久化对象之间实现一致性。
+
+Amino 还旨在实现以下目标（不完整列表）：
+
+* 二进制字节必须可以使用模式进行解码。
+* 模式必须可以升级。
+* 编码器和解码器的逻辑必须相对简单。
+
+然而，我们认为 Amino 并未完全实现这些目标，并且无法完全满足 Cosmos SDK 中真正灵活的跨语言和多客户端兼容的编码协议的需求。特别是，在支持各种语言编写的客户端之间提供真正的向后兼容性和可升级性方面，Amino 已经被证明是一个巨大的痛点。此外，通过分析和各种基准测试，Amino 已被证明是 Cosmos SDK 中极大的性能瓶颈<sup>1</sup>。这在模拟和应用程序事务吞吐量的性能上得到了很大的体现。
+
+因此，我们需要采用符合以下状态序列化标准的编码协议：
+
+* 与语言无关
+* 与平台无关
+* 支持丰富的客户端和繁荣的生态系统
+* 高性能
+* 编码后消息尺寸最小
+* 基于代码生成而非反射
+* 支持向后和向前兼容
+
+请注意，迁移离开 Amino 应被视为一个双管齐下的方法，即状态和客户端编码。
+本文档重点讨论 Cosmos SDK 状态机中的状态序列化。将会有一个相应的文档来解决客户端编码问题。
+
+## 决策
+
+我们将采用 [Protocol Buffers](https://developers.google.com/protocol-buffers) 来序列化 Cosmos SDK 中的持久化结构化数据，同时为希望继续使用 Amino 的应用程序提供清晰的机制和开发者体验。我们将通过更新模块以接受一个编解码器接口 `Marshaler`，而不是具体的 Amino 编解码器，来提供这个机制。此外，Cosmos SDK 将提供两个 `Marshaler` 接口的具体实现：`AminoCodec` 和 `ProtoCodec`。
+
+* `AminoCodec`：使用 Amino 进行二进制和 JSON 编码。
+* `ProtoCodec`：使用 Protobuf 进行二进制和 JSON 编码。
+
+模块将使用在应用程序中实例化的编解码器。默认情况下，Cosmos SDK 的 `simapp` 在 `MakeTestEncodingConfig` 函数中实例化一个 `ProtoCodec` 作为 `Marshaler` 的具体实现。如果应用程序开发者希望，可以轻松地覆盖这个设置。
+
+最终目标是用 Protobuf 编码替换 Amino JSON 编码，从而使模块接受和/或扩展 `ProtoCodec`。在那之前，Amino JSON 仍然提供给遗留用例。Cosmos SDK 中仍然有一些地方硬编码了 Amino JSON，例如遗留 API REST 端点和 `x/params` 存储。计划逐步将它们转换为 Protobuf。
+
+### 模块编解码器
+
+对于不需要处理和序列化接口的模块，迁移到 Protobuf 的路径非常直接。这些模块只需将通过具体的 Amino 编解码器进行编码和持久化的任何现有类型迁移到 Protobuf，并使其 keeper 接受一个 `Marshaler`，该 `Marshaler` 将是一个 `ProtoCodec`。这个迁移非常简单，因为现有的代码将继续正常工作。
+
+注意，任何需要对`bool`或`int64`等原始类型进行编码的业务逻辑都应该使用[gogoprotobuf](https://github.com/cosmos/gogoproto)值类型。
+
+示例：
+
+```go
+  ts, err := gogotypes.TimestampProto(completionTime)
+  if err != nil {
+    // ...
+  }
+
+  bz := cdc.MustMarshal(ts)
+```
+
+然而，模块在目的和设计上可能有很大的差异，因此我们必须支持模块能够编码和处理接口（例如`Account`或`Content`）的能力。对于这些模块，它们必须定义自己的编解码器接口，扩展`Marshaler`。这些特定接口是模块独有的，并且将包含知道如何序列化所需接口的方法约定。
+
+示例：
+
+```go
+// x/auth/types/codec.go
+
+type Codec interface {
+  codec.Codec
+
+  MarshalAccount(acc exported.Account) ([]byte, error)
+  UnmarshalAccount(bz []byte) (exported.Account, error)
+
+  MarshalAccountJSON(acc exported.Account) ([]byte, error)
+  UnmarshalAccountJSON(bz []byte) (exported.Account, error)
+}
+```
+
+### 使用`Any`编码接口
+
+通常情况下，模块级别的`.proto`文件应该定义消息，使用[`google.protobuf.Any`](https://github.com/protocolbuffers/protobuf/blob/master/src/google/protobuf/any.proto)来编码接口。在[扩展讨论](https://github.com/cosmos/cosmos-sdk/issues/6030)之后，选择了`Any`作为首选方案，而不是我们原始的protobuf设计中的应用级`oneof`。支持`Any`的论点可以总结如下：
+
+* `Any`为处理接口提供了更简单、更一致的客户端用户体验，而应用级别的`oneof`需要在应用程序之间更加仔细地协调。使用`oneof`创建通用的事务签名库可能很麻烦，并且关键逻辑可能需要为每个链重新实现。
+* `Any`比`oneof`更能抵抗人为错误。
+* 对于模块和应用程序来说，实现`Any`通常更简单。
+
+使用`Any`的主要反对意见集中在其额外的空间和可能的性能开销上。将来可以通过在持久层使用压缩来处理空间开销，而性能影响可能很小。因此，不使用`Any`被视为一种过早的优化，用户体验是更高级别的关注点。
+
+请注意，鉴于Cosmos SDK决定采用上述`Codec`接口，应用程序仍然可以选择使用`oneof`来编码状态和事务，但这不是推荐的方法。如果应用程序选择使用`oneof`而不是`Any`，它们可能会失去与支持多个链的客户端应用程序的兼容性。因此，开发人员应该仔细考虑他们更关心的是可能是一种过早的优化还是最终用户和客户端开发人员的用户体验。
+
+### `Any`的安全使用
+
+默认情况下，[gogo protobuf实现的`Any`](https://pkg.go.dev/github.com/cosmos/gogoproto/types)使用[全局类型注册](https://github.com/cosmos/gogoproto/blob/master/proto/properties.go#L540)来将`Any`中打包的值解码为具体的go类型。这会引入一个漏洞，即依赖树中的任何恶意模块都可以向全局protobuf注册表注册一个类型，并导致在引用该类型的事务中加载和解组。
+
+为了防止这种情况发生，我们引入了一种类型注册机制，通过`InterfaceRegistry`接口将`Any`值解码为具体类型，这与使用Amino进行类型注册有些相似：
+
+```go
+type InterfaceRegistry interface {
+    // RegisterInterface associates protoName as the public name for the
+    // interface passed in as iface
+    // Ex:
+    //   registry.RegisterInterface("cosmos_sdk.Msg", (*sdk.Msg)(nil))
+    RegisterInterface(protoName string, iface interface{})
+
+    // RegisterImplementations registers impls as a concrete implementations of
+    // the interface iface
+    // Ex:
+    //  registry.RegisterImplementations((*sdk.Msg)(nil), &MsgSend{}, &MsgMultiSend{})
+    RegisterImplementations(iface interface{}, impls ...proto.Message)
+
+}
+```
+
+除了作为白名单之外，`InterfaceRegistry`还可以用于向客户端传递满足接口的具体类型列表。
+
+在.proto文件中：
+
+* 接受接口的字段应使用`cosmos_proto.accepts_interface`进行注释，注释中使用与`InterfaceRegistry.RegisterInterface`中传递的`protoName`相同的全限定名
+* 接口实现应使用`cosmos_proto.implements_interface`进行注释，注释中使用与`InterfaceRegistry.RegisterInterface`中传递的`protoName`相同的全限定名
+
+在将来，`protoName`、`cosmos_proto.accepts_interface`、`cosmos_proto.implements_interface`可以通过代码生成、反射和/或静态检查来使用。
+
+实现`InterfaceRegistry`的相同结构体还将实现一个用于解包`Any`的接口`InterfaceUnpacker`：
+
+```go
+type InterfaceUnpacker interface {
+    // UnpackAny unpacks the value in any to the interface pointer passed in as
+    // iface. Note that the type in any must have been registered with
+    // RegisterImplementations as a concrete type for that interface
+    // Ex:
+    //    var msg sdk.Msg
+    //    err := ctx.UnpackAny(any, &msg)
+    //    ...
+    UnpackAny(any *Any, iface interface{}) error
+}
+```
+
+请注意，`InterfaceRegistry`的使用不会偏离`Any`的标准protobuf用法，它只是为golang使用引入了一个安全性和内省层。
+
+`InterfaceRegistry`将成为上述描述的`ProtoCodec`的成员。为了让模块注册接口类型，应用程序模块可以选择实现以下接口：
+
+```go
+type InterfaceModule interface {
+    RegisterInterfaceTypes(InterfaceRegistry)
+}
+```
+
+模块管理器将包含一个方法，在每个实现该方法的模块上调用`RegisterInterfaceTypes`，以填充`InterfaceRegistry`。
+
+### 使用 `Any` 编码状态
+
+Cosmos SDK 将提供支持方法 `MarshalInterface` 和 `UnmarshalInterface` 来隐藏将接口类型包装到 `Any` 中的复杂性，并允许轻松进行序列化。
+
+```go
+import "github.com/cosmos/cosmos-sdk/codec"
+
+// note: eviexported.Evidence is an interface type
+func MarshalEvidence(cdc codec.BinaryCodec, e eviexported.Evidence) ([]byte, error) {
+	return cdc.MarshalInterface(e)
+}
+
+func UnmarshalEvidence(cdc codec.BinaryCodec, bz []byte) (eviexported.Evidence, error) {
+	var evi eviexported.Evidence
+	err := cdc.UnmarshalInterface(&evi, bz)
+    return err, nil
+}
+```
+
+### 在 `sdk.Msg` 中使用 `Any`
+
+类似的概念也适用于包含接口字段的消息。例如，我们可以将 `MsgSubmitEvidence` 定义如下，其中 `Evidence` 是一个接口：
+
+```protobuf
+// x/evidence/types/types.proto
+
+message MsgSubmitEvidence {
+  bytes submitter = 1
+    [
+      (gogoproto.casttype) = "github.com/cosmos/cosmos-sdk/types.AccAddress"
+    ];
+  google.protobuf.Any evidence = 2;
+}
+```
+
+请注意，为了从 `Any` 中解包证据，我们确实需要一个对 `InterfaceRegistry` 的引用。为了在诸如 `ValidateBasic` 这样的方法中引用证据，这些方法不需要了解 `InterfaceRegistry`，我们引入了一个 `UnpackInterfaces` 阶段来进行反序列化，该阶段在需要之前解包接口。
+
+### 解包接口
+
+为了实现反序列化的 `UnpackInterfaces` 阶段，该阶段在需要之前解包 `Any` 中包装的接口，我们创建了一个 `sdk.Msg` 和其他类型可以实现的接口：
+
+```go
+type UnpackInterfacesMessage interface {
+  UnpackInterfaces(InterfaceUnpacker) error
+}
+```
+
+我们还在 `Any` 结构体本身上引入了一个私有的 `cachedValue interface{}` 字段，并提供了一个公共的 getter `GetCachedValue() interface{}`。
+
+`UnpackInterfaces` 方法将在消息反序列化期间的 `Unmarshal` 之后调用，任何包装在 `Any` 中的接口值都将被解码并存储在 `cachedValue` 中以供以后引用。
+
+然后，解包后的接口值可以在任何代码中安全使用，而无需了解 `InterfaceRegistry`，并且消息可以引入一个简单的 getter 来将缓存的值转换为正确的接口类型。
+
+这样做的额外好处是，`Any` 值的反序列化仅在初始反序列化期间发生一次，而不是每次读取该值时都需要进行反序列化。此外，当首次打包 `Any` 值（例如在调用 `NewMsgSubmitEvidence` 时）时，原始接口值会被缓存，以便不需要再次进行反序列化来读取它。
+
+`MsgSubmitEvidence` 可以实现 `UnpackInterfaces`，并添加一个方便的 getter `GetEvidence`，如下所示：
+
+```go
+func (msg MsgSubmitEvidence) UnpackInterfaces(ctx sdk.InterfaceRegistry) error {
+  var evi eviexported.Evidence
+  return ctx.UnpackAny(msg.Evidence, *evi)
+}
+
+func (msg MsgSubmitEvidence) GetEvidence() eviexported.Evidence {
+  return msg.Evidence.GetCachedValue().(eviexported.Evidence)
+}
+```
+
+### Amino 兼容性
+
+我们的自定义 `Any` 实现可以与 Amino 无缝使用，只需使用正确的编解码器实例。这意味着嵌入在 `Any` 中的接口将像常规的 Amino 接口一样进行 Amino 编组（假设它们已经正确地在 Amino 中注册）。
+
+为了使此功能正常工作：
+
+* **所有旧代码必须使用 `*codec.LegacyAmino` 而不是 `*amino.Codec`，后者现在是一个正确处理 `Any` 的包装器**
+* **所有新代码应使用与 amino 和 protobuf 兼容的 `Marshaler`**
+* 此外，在 v0.39 之前，`codec.LegacyAmino` 将被重命名为 `codec.LegacyAmino`。
+
+### 为什么没有选择 X
+
+有关与其他协议的更全面比较，请参见[此处](https://codeburst.io/json-vs-protocol-buffers-vs-flatbuffers-a4247f8bda6f)。
+
+### Cap'n Proto
+
+虽然 [Cap’n Proto](https://capnproto.org/) 看起来是 Protobuf 的一个有利替代，因为它原生支持接口/泛型和内置规范化，但与 Protobuf 相比，它缺乏丰富的客户端生态系统，并且还不够成熟。
+
+### FlatBuffers
+
+[FlatBuffers](https://google.github.io/flatbuffers/) 也是一个潜在的可行替代方案，主要区别在于 FlatBuffers 不需要将数据解析/解包到二级表示形式之前，您就可以访问数据，通常与每个对象的内存分配相结合。
+
+然而，这将需要大量的研究和全面了解迁移的范围和前进路径，这并不是立即清楚的。此外，FlatBuffers 不适用于不受信任的输入。
+
+## 未来改进和路线图
+
+将来，我们可能会考虑在持久化层之上添加一个压缩层，它不会更改事务或 Merkle 树哈希，但会减少 `Any` 的存储开销。此外，我们可能会采用 protobuf 命名约定，使类型 URL 更简洁，同时保持描述性。
+
+还可以在将来探索围绕 `Any` 的使用的额外代码生成支持，以使 Go 开发人员的用户体验更加无缝。
+
+## 后果
+
+### 积极的
+
+* 显著的性能提升。
+* 支持向前和向后的类型兼容性。
+* 更好地支持跨语言客户端。
+
+### 消极的
+
+* 需要学习曲线来理解和实现 Protobuf 消息。
+* 由于使用了 `Any`，消息大小稍大，尽管这在未来可以通过压缩层来抵消。
+
+### 中性的
+
+## 参考资料
+
+1. https://github.com/cosmos/cosmos-sdk/issues/4977
+2. https://github.com/cosmos/cosmos-sdk/issues/5444
+
+
 # ADR 019: Protocol Buffer State Encoding
 
 ## Changelog

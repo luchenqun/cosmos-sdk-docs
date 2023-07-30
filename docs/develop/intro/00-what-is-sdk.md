@@ -1,3 +1,32 @@
+# 什么是Cosmos SDK
+
+[Cosmos SDK](https://github.com/cosmos/cosmos-sdk)是一个用于构建多资产公共权益证明（PoS）<df value="区块链">区块链</df>的开源框架，例如Cosmos Hub，以及权限控制的权威证明（PoA）区块链。使用Cosmos SDK构建的区块链通常被称为**特定应用区块链**。
+
+Cosmos SDK的目标是允许开发人员轻松地从头开始创建自定义区块链，并能够与其他区块链进行本地互操作。我们将Cosmos SDK视为类似于npm的框架，用于在[CometBFT](https://github.com/cometbft/cometbft)之上构建安全的区块链应用程序。基于SDK的区块链由可组合的[模块](../../integrate/building-modules/01-intro.md)构建，其中大部分是开源的，并且可供任何开发人员随时使用。任何人都可以为Cosmos SDK创建一个模块，而将已构建的模块集成到应用程序中只需简单地导入它们。此外，Cosmos SDK是一个基于能力的系统，允许开发人员更好地推理模块之间交互的安全性。要深入了解能力，请跳转到[对象能力模型](../advanced-concepts/10-ocap.md)。
+
+## 什么是特定应用区块链
+
+当今区块链世界中的一种开发范式是虚拟机区块链，例如以太坊，其中开发通常围绕在现有区块链上构建去中心化应用作为一组智能合约。虽然智能合约对于某些用例（例如ICO）可能非常好，但对于构建复杂的去中心化平台来说，它们往往不够灵活。更一般地说，智能合约在灵活性、主权和性能方面具有局限性。
+
+特定应用区块链提供了与虚拟机区块链完全不同的开发范式。特定应用区块链是定制化的区块链，用于运行单个应用程序：开发人员可以自由决定应用程序运行所需的设计决策。它们还可以提供更好的主权、安全性和性能。
+
+了解更多关于[应用特定区块链](01-why-app-specific.md)的信息。
+
+## 为什么选择 Cosmos SDK
+
+Cosmos SDK 是目前构建自定义应用特定区块链的最先进框架。以下是一些选择使用 Cosmos SDK 构建去中心化应用程序的原因：
+
+* Cosmos SDK 内置的默认共识引擎是 [CometBFT](https://github.com/cometbft/cometbft)。CometBFT 是目前（也是唯一）最成熟的 BFT 共识引擎。它被广泛应用于行业中，并被认为是构建权益证明系统的黄金标准共识引擎。
+* Cosmos SDK 是开源的，并且旨在通过可组合的[模块](../../integrate/modules)轻松构建区块链。随着开源 Cosmos SDK 模块生态系统的不断发展，使用它构建复杂的去中心化平台将变得越来越容易。
+* Cosmos SDK 受到基于能力的安全性的启发，并通过多年与区块链状态机的斗争而得到改进。这使得 Cosmos SDK 成为构建区块链的非常安全的环境。
+* 最重要的是，Cosmos SDK 已经被用于构建许多应用特定区块链，这些区块链已经投入生产。其中包括 [Cosmos Hub](https://hub.cosmos.network)、[IRIS Hub](https://irisnet.org)、[Binance Chain](https://docs.binance.org/)、[Terra](https://terra.money/) 或 [Kava](https://www.kava.io/)。[还有更多](https://cosmos.network/ecosystem)正在基于 Cosmos SDK 进行开发。
+
+## 开始使用 Cosmos SDK
+
+* 了解有关 Cosmos SDK 应用程序架构的更多信息，请参阅[教程](02-sdk-app-architecture.md)。
+* 通过 [Cosmos SDK 教程](https://cosmos.network/docs/tutorial)了解如何从头开始构建应用特定区块链。
+
+
 # What is the Cosmos SDK
 
 The [Cosmos SDK](https://github.com/cosmos/cosmos-sdk) is an open-source framework for building multi-asset public Proof-of-Stake (PoS) <df value="blockchain">blockchains</df>, like the Cosmos Hub, as well as permissioned Proof-of-Authority (PoA) blockchains. Blockchains built with the Cosmos SDK are generally referred to as **application-specific blockchains**.

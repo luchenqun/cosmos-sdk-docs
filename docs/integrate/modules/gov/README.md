@@ -1,3 +1,2268 @@
+# `x/gov`
+
+## 摘要
+
+本文规定了Cosmos SDK的治理模块，该模块首次在2016年6月的[Cosmos白皮书](https://cosmos.network/about/whitepaper)中进行了描述。
+
+该模块使得基于Cosmos SDK的区块链能够支持链上治理系统。在该系统中，链上原生质押代币的持有者可以按照1代币1票的原则对提案进行投票。下面是该模块目前支持的功能列表：
+
+* **提案提交：** 用户可以通过缴纳押金来提交提案。一旦达到最低押金要求，提案进入投票期。
+* **投票：** 参与者可以对达到最低押金要求的提案进行投票。
+* **继承和惩罚：** 如果委托人自己没有投票，他们将继承其验证人的投票权。
+* **取回押金：** 如果提案被接受或拒绝，参与提案的用户可以取回他们的押金。如果提案被否决或从未进入投票期，押金将被销毁。
+
+该模块将在Cosmos网络中的第一个Hub——Cosmos Hub中使用。未来可能添加的功能在[未来改进](#future-improvements)中进行了描述。
+
+## 目录
+
+以下规范使用*ATOM*作为原生质押代币。该模块可以通过将*ATOM*替换为链上的原生质押代币来适应任何权益证明区块链。
+
+* [概念](#concepts)
+    * [提案提交](#proposal-submission)
+    * [押金](#deposit)
+    * [投票](#vote)
+* [状态](#state)
+    * [提案](#proposals)
+    * [参数和基本类型](#parameters-and-base-types)
+    * [押金](#deposit-1)
+    * [验证人治理信息](#validatorgovinfo)
+    * [存储](#stores)
+    * [提案处理队列](#proposal-processing-queue)
+    * [旧版提案](#legacy-proposal)
+* [消息](#messages)
+    * [提案提交](#proposal-submission-1)
+    * [押金](#deposit-2)
+    * [投票](#vote-1)
+* [事件](#events)
+    * [EndBlocker](#endblocker)
+    * [处理器](#handlers)
+* [参数](#parameters)
+* [客户端](#client)
+    * [CLI](#cli)
+    * [gRPC](#grpc)
+    * [REST](#rest)
+* [元数据](#metadata)
+    * [提案](#proposal-3)
+    * [投票](#vote-5)
+* [未来改进](#future-improvements)
+
+## 概念
+
+*免责声明：这是一个正在进行中的工作。机制可能会发生变化。*
+
+治理流程分为几个步骤，如下所述：
+
+* **提案提交：** 提案与一笔押金一起提交到区块链上。
+* **投票：** 一旦押金达到一定值（`MinDeposit`），提案将被确认并开启投票。持有抵押的 Atom 可以发送 `TxGovVote` 交易来对提案进行投票。
+* **执行：** 经过一段时间后，投票结果将被统计，并根据结果执行提案中的消息。
+
+### 提案提交
+
+#### 提交提案的权利
+
+每个账户都可以通过发送 `MsgSubmitProposal` 交易来提交提案。一旦提案提交成功，它将通过其唯一的 `proposalID` 进行标识。
+
+#### 提案消息
+
+提案包括一系列的 `sdk.Msg`，如果提案通过，这些消息将自动执行。这些消息由治理 `ModuleAccount` 自身执行。例如，希望允许某些消息仅由治理执行的模块（如 `x/upgrade`）应在相应的消息服务器中添加一个白名单，授予治理模块在达到法定人数后执行该消息的权利。治理模块使用 `MsgServiceRouter` 来检查这些消息是否正确构造，并具有相应的执行路径，但不执行完整的有效性检查。
+
+### 押金
+
+为了防止垃圾信息，提案必须以 `MinDeposit` 参数定义的货币进行提交。
+
+当提交提案时，必须附带一笔押金，该押金必须严格为正数，但可以小于 `MinDeposit`。提交者不需要自己支付整个押金。新创建的提案将存储在*非活动提案队列*中，并保持在那里，直到其押金达到 `MinDeposit`。其他代币持有者可以通过发送 `Deposit` 交易来增加提案的押金。如果在押金截止时间（不再接受押金的时间）之前，提案未能通过 `MinDeposit`，则提案将被销毁：提案将从状态中移除，并且押金将被销毁（参见 x/gov `EndBlocker`）。如果在押金截止时间之前，提案的押金达到 `MinDeposit` 阈值（即使在提案提交期间），则提案将被移动到*活动提案队列*中，并开始投票期。
+
+存款被托管并由治理 `ModuleAccount` 持有，直到提案最终确定（通过或拒绝）。
+
+#### 存款退还和销毁
+
+当提案最终确定时，根据提案的最终计数，存款中的代币要么退还给各自的存款人（从治理 `ModuleAccount` 转移），要么被销毁：
+
+* 如果提案被批准或拒绝但没有被否决，每个存款将自动退还给其各自的存款人（从治理 `ModuleAccount` 转移）。
+* 当提案被否决且否决票超过1/3时，存款将从治理 `ModuleAccount` 中被销毁，并且提案信息以及其存款信息将从状态中删除。
+* 所有退还或销毁的存款将从状态中删除。在销毁或退还存款时会发布事件。
+
+### 投票
+
+#### 参与者
+
+*参与者* 是有权对提案进行投票的用户。在 Cosmos Hub 上，参与者是已质押的 Atom 持有者。未质押的 Atom 持有者和其他用户没有参与治理的权利。但是，他们可以提交提案并存款。
+
+请注意，当 *参与者* 既有质押的 Atom 又有未质押的 Atom 时，他们的投票权仅根据其质押的 Atom 持有量计算。
+
+#### 投票期
+
+一旦提案达到 `MinDeposit`，它立即进入 `投票期`。我们将 `投票期` 定义为投票开启和投票关闭之间的时间间隔。`投票期` 应该始终比 `解质押期` 短，以防止重复投票。`投票期` 的初始值为2周。
+
+#### 选项集
+
+提案的选项集指的是参与者在投票时可以选择的一组选项。
+
+初始选项集包括以下选项：
+
+* `赞成`
+* `反对`
+* `否决`
+* `弃权`
+
+`否决` 选项相当于 `反对`，但还增加了一个 `否决` 投票。`弃权` 选项允许选民表示他们不打算赞成或反对提案，但接受投票结果。
+
+*注意：对于紧急提案，我们可能应该在用户界面中添加一个“非紧急”选项，以进行 `否决` 投票。*
+
+#### 加权投票
+
+[ADR-037](https://github.com/cosmos/cosmos-sdk/blob/main/docs/architecture/adr-037-gov-split-vote.md) 引入了加权投票功能，允许质押者将他们的投票分成几个选项。例如，它可以使用其投票权的70%投票赞成，使用其投票权的30%投票反对。
+
+通常情况下，拥有该地址的实体可能不是单个个体。例如，一个公司可能有不同的利益相关者希望进行不同的投票，因此允许他们分割他们的投票权是有意义的。目前，他们无法进行“透传投票”并赋予他们的用户对其代币的投票权。然而，通过这个系统，交易所可以对其用户进行投票偏好的调查，然后按照调查结果在链上按比例进行投票。
+
+为了在链上表示加权投票，我们使用以下 Protobuf 消息。
+
+```protobuf reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/proto/cosmos/gov/v1beta1/gov.proto#L34-L47
+```
+
+```protobuf reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/proto/cosmos/gov/v1beta1/gov.proto#L181-L201
+```
+
+对于加权投票要有效，`options` 字段不能包含重复的投票选项，并且所有选项的权重之和必须等于1。
+
+### 法定人数
+
+法定人数被定义为提案需要获得的最低投票权百分比，以使结果有效。
+
+### 快速提案
+
+提案可以被加速，使提案使用较短的投票持续时间和更高的计票阈值。如果在较短的投票持续时间范围内，加速提案未能达到阈值，则加速提案将转换为常规提案，并在常规投票条件下重新开始投票。
+
+#### 阈值
+
+阈值被定义为提案被接受所需的最低比例的“赞成”票（不包括“弃权”票）。
+
+最初，阈值被设定为“赞成”票的50%，不包括“弃权”票。如果超过三分之一的所有投票是“反对否决”票，则存在否决的可能性。请注意，这两个值都是从链上参数 `TallyParams` 派生的，可以通过治理进行修改。
+这意味着提案被接受当且仅当：
+
+* 存在已质押的代币。
+* 已达到法定人数。
+* `弃权` 票数比例低于 1/1。
+* `否决` 票数比例低于 1/3，包括 `弃权` 票数。
+* 在投票期结束时，`赞成` 票数（不包括 `弃权` 票数）比例超过 1/2。
+
+对于加快处理的提案，默认的门槛比 *普通提案* 更高，即 66.7%。
+
+#### 继承
+
+如果委托人没有投票，将继承其验证人的投票。
+
+* 如果委托人在其验证人之前投票，将不会继承验证人的投票。
+* 如果委托人在其验证人之后投票，将用自己的投票覆盖验证人的投票。如果提案紧急，可能会在委托人有机会反应并覆盖验证人的投票之前关闭投票。这不是一个问题，因为提案需要在投票期结束时达到超过总投票权的 2/3 才能通过。因为只有 1/3 + 1 的验证权力可以串通起来审查交易，所以已经假设超过此门槛的范围内不存在串通行为。
+
+#### 验证人未投票的惩罚
+
+目前，验证人未投票不会受到惩罚。
+
+#### 治理地址
+
+以后，我们可能会添加具有权限的密钥，只能对某些模块的交易进行签名。对于 MVP，`治理地址` 将是在账户创建时生成的主验证人地址。该地址对应于与负责签署共识消息的 CometBFT PrivKey 不同的 PrivKey。因此，验证人不需要使用敏感的 CometBFT PrivKey 对治理交易进行签名。
+
+#### 可燃参数
+
+有三个参数用于确定提案的存款是否应该被烧毁或退还给存款人。
+
+* `BurnVoteVeto` 如果提案被否决，则烧毁提案的存款。
+* `BurnVoteQuorum` 如果投票未达到法定人数，则烧毁提案的存款。
+* `BurnProposalDepositPrevote` 如果提案未进入投票阶段，则烧毁提案的存款。
+
+> 注意：这些参数可以通过治理进行修改。
+
+## 状态
+
+### 宪法
+
+`Constitution`（宪法）可以在创世状态中找到。它是一个字符串字段，用于描述特定区块链的目的和预期规范。以下是一些宪法字段的用法示例：
+
+* 定义链的目的，为其未来发展奠定基础
+* 设定委托人的期望
+* 设定验证人的期望
+* 定义链与“现实世界”实体（如基金会或公司）的关系
+
+由于这更多是一个社交功能而不是技术功能，我们现在将介绍一些可能在创世宪法中有用的项目：
+
+* 是否存在对治理的限制？
+    * 社区是否可以削减不再希望存在的大户的钱包？（例如：Juno 提案 4 和 16）
+    * 治理是否可以“社交削减”使用未经批准的 MEV 的验证人？（例如：commonwealth.im/osmosis）
+    * 在经济紧急情况下，验证人应该做什么？
+        * 2022 年 5 月的 Terra 崩溃中，验证人选择运行一个新的二进制文件，其中的代码未经治理批准，因为治理代币已经贬值为零。
+* 链的目的是什么？
+    * 最好的例子是 Cosmos Hub，不同的创始团队对网络目的有不同的解释。
+
+这个创世条目“宪法”并不适用于现有的链，它们应该使用其治理系统批准一份宪法。相反，它适用于新的链。它将使验证人对目的和运行节点时对他们的期望有更清晰的了解。同样，对于社区成员来说，宪法将使他们对“链团队”和验证人的期望有一些了解。
+
+这个宪法被设计为不可变的，只能放在创世状态中，尽管随着时间的推移，可以通过对 cosmos-sdk 的拉取请求来允许治理修改宪法。希望对原始宪法进行修正的社区应该使用治理机制和“信号提案”来实现这一目标。
+
+**宇宙链宪法的理想使用场景**
+
+作为链开发者，您决定为以下关键用户群体提供清晰度：
+
+* 验证者
+* 代币持有者
+* 开发者（您自己）
+
+您使用宪法在创世区块中不可变地存储一些Markdown，以便在出现困难问题时，宪法可以为社区提供指导。
+
+### 提案
+
+`Proposal`对象用于计票和通常跟踪提案的状态。
+它们包含一系列任意的`sdk.Msg`，治理模块将尝试解决并在提案通过后执行。`Proposal`通过唯一的id进行标识，并包含一系列时间戳：`submit_time`、`deposit_end_time`、`voting_start_time`、`voting_end_time`，用于跟踪提案的生命周期。
+
+```protobuf reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/proto/cosmos/gov/v1/gov.proto#L51-L99
+```
+
+一个提案通常需要更多的内容来解释其目的，而不仅仅是一组消息，还需要一些更大的理由，并允许感兴趣的参与者讨论和辩论提案。
+在大多数情况下，**鼓励使用链下系统来支持链上治理过程**。
+为了适应这一点，提案包含一个特殊的**`metadata`**字段，一个字符串，可用于为提案添加上下文。`metadata`字段允许网络进行自定义使用，但是预期该字段包含一个URL或使用诸如[IPFS](https://docs.ipfs.io/concepts/content-addressing/)之类的系统的CID形式。为了支持网络之间的互操作性，SDK建议`metadata`表示以下`JSON`模板：
+
+```json
+{
+  "title": "...",
+  "description": "...",
+  "forum": "...", // a link to the discussion platform (i.e. Discord)
+  "other": "..." // any extra data that doesn't correspond to the other fields
+}
+```
+
+这样客户端就可以更容易地支持多个网络。
+
+元数据的最大长度由应用程序开发者选择，并作为配置传递给治理keeper。SDK中的默认最大长度为255个字符。
+
+#### 编写使用治理的模块
+
+您可能希望使用治理来执行链或个别模块的许多方面，例如更改各种参数。这非常简单。首先，编写您的消息类型和`MsgServer`实现。在keeper中添加一个`authority`字段，该字段将在构造函数中由治理模块账户填充：`govKeeper.GetGovernanceAccount().GetAddress()`。然后，在`msg_server.go`中的方法中，对消息执行一个检查，检查签名者是否与`authority`匹配。这将防止任何用户执行该消息。
+
+### 参数和基本类型
+
+`Parameters` 定义了投票运行的规则。在任何给定时间只能有一个活动的参数集。如果治理想要更改参数集，无论是修改一个值还是添加/删除一个参数字段，都必须创建一个新的参数集并将之前的参数集设置为非活动状态。
+
+#### DepositParams
+
+```protobuf reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/proto/cosmos/gov/v1/gov.proto#L152-L162
+```
+
+#### VotingParams
+
+```protobuf reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/proto/cosmos/gov/v1/gov.proto#L164-L168
+```
+
+#### TallyParams
+
+```protobuf reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/proto/cosmos/gov/v1/gov.proto#L170-L182
+```
+
+参数存储在全局的 `GlobalParams` KVStore 中。
+
+此外，我们引入了一些基本类型：
+
+```go
+type Vote byte
+
+const (
+    VoteYes         = 0x1
+    VoteNo          = 0x2
+    VoteNoWithVeto  = 0x3
+    VoteAbstain     = 0x4
+)
+
+type ProposalType  string
+
+const (
+    ProposalTypePlainText       = "Text"
+    ProposalTypeSoftwareUpgrade = "SoftwareUpgrade"
+)
+
+type ProposalStatus byte
+
+
+const (
+    StatusNil           ProposalStatus = 0x00
+    StatusDepositPeriod ProposalStatus = 0x01  // Proposal is submitted. Participants can deposit on it but not vote
+    StatusVotingPeriod  ProposalStatus = 0x02  // MinDeposit is reached, participants can vote
+    StatusPassed        ProposalStatus = 0x03  // Proposal passed and successfully executed
+    StatusRejected      ProposalStatus = 0x04  // Proposal has been rejected
+    StatusFailed        ProposalStatus = 0x05  // Proposal passed but failed execution
+)
+```
+
+### 存款
+
+```protobuf reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/proto/cosmos/gov/v1/gov.proto#L38-L49
+```
+
+### ValidatorGovInfo
+
+此类型在计算投票结果时使用的临时映射中使用。
+
+```go
+  type ValidatorGovInfo struct {
+    Minus     sdk.Dec
+    Vote      Vote
+  }
+```
+
+## 存储
+
+:::note
+存储是多存储中的 KVStore。查找存储的键是列表中的第一个参数。
+:::
+
+我们将使用一个 KVStore `Governance` 来存储四个映射：
+
+* 从 `proposalID|'proposal'` 到 `Proposal` 的映射。
+* 从 `proposalID|'addresses'|address` 到 `Vote` 的映射。这个映射允许我们通过在 `proposalID:addresses` 上进行范围查询来查询投票提案的所有地址以及它们的投票。
+* 从 `ParamsKey|'Params'` 到 `Params` 的映射。这个映射允许查询所有 x/gov 参数。
+* 从 `VotingPeriodProposalKeyPrefix|proposalID` 到一个字节的映射。这个映射允许我们以非常低的 gas 成本知道一个提案是否处于投票期。
+
+为了伪代码的目的，这里是我们将用来在存储中读取或写入的两个函数：
+
+* `load(StoreKey, Key)`: 从多存储中的键 `StoreKey` 找到的存储中检索存储在键 `Key` 处的项目。
+* `store(StoreKey, Key, value)`: 在多存储中的键 `StoreKey` 找到的存储中将值 `Value` 写入键 `Key` 处。
+
+### 提案处理队列
+
+**存储:**
+
+* `ProposalProcessingQueue`: 一个队列 `queue[proposalID]` 包含所有达到 `MinDeposit` 的提案的 `ProposalIDs`。在每个 `EndBlock` 中，处理已经达到投票期限的提案。为了处理一个已完成的提案，应用程序会统计投票结果，计算每个验证人的投票结果，并检查验证人集合中的每个验证人是否已经投票。如果提案被接受，将退还存款。最后，执行提案内容的 `Handler`。
+
+而 `ProposalProcessingQueue` 的伪代码如下:
+
+```go
+  in EndBlock do
+
+    for finishedProposalID in GetAllFinishedProposalIDs(block.Time)
+      proposal = load(Governance, <proposalID|'proposal'>) // proposal is a const key
+
+      validators = Keeper.getAllValidators()
+      tmpValMap := map(sdk.AccAddress)ValidatorGovInfo
+
+      // Initiate mapping at 0. This is the amount of shares of the validator's vote that will be overridden by their delegator's votes
+      for each validator in validators
+        tmpValMap(validator.OperatorAddr).Minus = 0
+
+      // Tally
+      voterIterator = rangeQuery(Governance, <proposalID|'addresses'>) //return all the addresses that voted on the proposal
+      for each (voterAddress, vote) in voterIterator
+        delegations = stakingKeeper.getDelegations(voterAddress) // get all delegations for current voter
+
+        for each delegation in delegations
+          // make sure delegation.Shares does NOT include shares being unbonded
+          tmpValMap(delegation.ValidatorAddr).Minus += delegation.Shares
+          proposal.updateTally(vote, delegation.Shares)
+
+        _, isVal = stakingKeeper.getValidator(voterAddress)
+        if (isVal)
+          tmpValMap(voterAddress).Vote = vote
+
+      tallyingParam = load(GlobalParams, 'TallyingParam')
+
+      // Update tally if validator voted
+      for each validator in validators
+        if tmpValMap(validator).HasVoted
+          proposal.updateTally(tmpValMap(validator).Vote, (validator.TotalShares - tmpValMap(validator).Minus))
+
+
+
+      // Check if proposal is accepted or rejected
+      totalNonAbstain := proposal.YesVotes + proposal.NoVotes + proposal.NoWithVetoVotes
+      if (proposal.Votes.YesVotes/totalNonAbstain > tallyingParam.Threshold AND proposal.Votes.NoWithVetoVotes/totalNonAbstain  < tallyingParam.Veto)
+        //  proposal was accepted at the end of the voting period
+        //  refund deposits (non-voters already punished)
+        for each (amount, depositor) in proposal.Deposits
+          depositor.AtomBalance += amount
+
+        stateWriter, err := proposal.Handler()
+        if err != nil
+            // proposal passed but failed during state execution
+            proposal.CurrentStatus = ProposalStatusFailed
+         else
+            // proposal pass and state is persisted
+            proposal.CurrentStatus = ProposalStatusAccepted
+            stateWriter.save()
+      else
+        // proposal was rejected
+        proposal.CurrentStatus = ProposalStatusRejected
+
+      store(Governance, <proposalID|'proposal'>, proposal)
+```
+
+### 传统提案
+
+传统提案是治理提案的旧实现。与可以包含任何消息的提案相反，传统提案允许提交一组预定义的提案。这些提案由它们的类型来定义。
+
+虽然提案应该使用治理提案的新实现，但我们仍然需要使用传统提案来提交 `software-upgrade` 和 `cancel-software-upgrade` 提案。
+
+有关如何在 [客户端部分](#client) 提交提案的更多信息。
+
+## 消息
+
+### 提案提交
+
+任何账户都可以通过 `MsgSubmitProposal` 交易提交提案。
+
+```protobuf reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/proto/cosmos/gov/v1/tx.proto#L42-L69
+```
+
+在 `MsgSubmitProposal` 消息的 `messages` 字段中传递的所有 `sdk.Msgs` 必须在应用程序的 `MsgServiceRouter` 中注册。这些消息中的每一个都必须有一个签名者，即治理模块账户。最后，元数据长度不能超过传递给治理保管人的 `maxMetadataLen` 配置。
+
+**状态修改:**
+
+* 生成新的 `proposalID`
+* 创建新的 `Proposal`
+* 初始化 `Proposal` 的属性
+* 减少发送者的余额 `InitialDeposit`
+* 如果达到 `MinDeposit`:
+    * 将 `proposalID` 推入 `ProposalProcessingQueue`
+* 将 `InitialDeposit` 从 `Proposer` 转移到治理 `ModuleAccount`
+
+一个 `MsgSubmitProposal` 交易可以按照以下伪代码进行处理。
+
+```go
+// PSEUDOCODE //
+// Check if MsgSubmitProposal is valid. If it is, create proposal //
+
+upon receiving txGovSubmitProposal from sender do
+
+  if !correctlyFormatted(txGovSubmitProposal)
+    // check if proposal is correctly formatted and the messages have routes to other modules. Includes fee payment.
+    // check if all messages' unique Signer is the gov acct.
+    // check if the metadata is not too long.
+    throw
+
+  initialDeposit = txGovSubmitProposal.InitialDeposit
+  if (initialDeposit.Atoms <= 0) OR (sender.AtomBalance < initialDeposit.Atoms)
+    // InitialDeposit is negative or null OR sender has insufficient funds
+    throw
+
+  if (txGovSubmitProposal.Type != ProposalTypePlainText) OR (txGovSubmitProposal.Type != ProposalTypeSoftwareUpgrade)
+
+  sender.AtomBalance -= initialDeposit.Atoms
+
+  depositParam = load(GlobalParams, 'DepositParam')
+
+  proposalID = generate new proposalID
+  proposal = NewProposal()
+
+  proposal.Messages = txGovSubmitProposal.Messages
+  proposal.Metadata = txGovSubmitProposal.Metadata
+  proposal.TotalDeposit = initialDeposit
+  proposal.SubmitTime = <CurrentTime>
+  proposal.DepositEndTime = <CurrentTime>.Add(depositParam.MaxDepositPeriod)
+  proposal.Deposits.append({initialDeposit, sender})
+  proposal.Submitter = sender
+  proposal.YesVotes = 0
+  proposal.NoVotes = 0
+  proposal.NoWithVetoVotes = 0
+  proposal.AbstainVotes = 0
+  proposal.CurrentStatus = ProposalStatusOpen
+
+  store(Proposals, <proposalID|'proposal'>, proposal) // Store proposal in Proposals mapping
+  return proposalID
+```
+
+### 存款
+
+一旦提交了提案，如果 `Proposal.TotalDeposit < ActiveParam.MinDeposit`，Atom 持有者可以发送 `MsgDeposit` 交易来增加提案的存款。
+
+```protobuf reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/proto/cosmos/gov/v1/tx.proto#L134-L147
+```
+
+**状态修改:**
+
+* 减少发送者的余额 `deposit`
+* 在 `proposal.Deposits` 中添加发送者的 `deposit`
+* 增加发送者的 `deposit` 到 `proposal.TotalDeposit`
+* 如果达到了 `MinDeposit`：
+    * 将 `proposalID` 推入 `ProposalProcessingQueueEnd`
+* 将存款从 `proposer` 转移到治理 `ModuleAccount`
+
+`MsgDeposit` 交易必须通过一系列检查才能有效。这些检查在以下伪代码中概述。
+
+```go
+// PSEUDOCODE //
+// Check if MsgDeposit is valid. If it is, increase deposit and check if MinDeposit is reached
+
+upon receiving txGovDeposit from sender do
+  // check if proposal is correctly formatted. Includes fee payment.
+
+  if !correctlyFormatted(txGovDeposit)
+    throw
+
+  proposal = load(Proposals, <txGovDeposit.ProposalID|'proposal'>) // proposal is a const key, proposalID is variable
+
+  if (proposal == nil)
+    // There is no proposal for this proposalID
+    throw
+
+  if (txGovDeposit.Deposit.Atoms <= 0) OR (sender.AtomBalance < txGovDeposit.Deposit.Atoms) OR (proposal.CurrentStatus != ProposalStatusOpen)
+
+    // deposit is negative or null
+    // OR sender has insufficient funds
+    // OR proposal is not open for deposit anymore
+
+    throw
+
+  depositParam = load(GlobalParams, 'DepositParam')
+
+  if (CurrentBlock >= proposal.SubmitBlock + depositParam.MaxDepositPeriod)
+    proposal.CurrentStatus = ProposalStatusClosed
+
+  else
+    // sender can deposit
+    sender.AtomBalance -= txGovDeposit.Deposit.Atoms
+
+    proposal.Deposits.append({txGovVote.Deposit, sender})
+    proposal.TotalDeposit.Plus(txGovDeposit.Deposit)
+
+    if (proposal.TotalDeposit >= depositParam.MinDeposit)
+      // MinDeposit is reached, vote opens
+
+      proposal.VotingStartBlock = CurrentBlock
+      proposal.CurrentStatus = ProposalStatusActive
+      ProposalProcessingQueue.push(txGovDeposit.ProposalID)
+
+  store(Proposals, <txGovVote.ProposalID|'proposal'>, proposal)
+```
+
+### 投票
+
+一旦达到 `ActiveParam.MinDeposit`，投票期开始。此时，持有质押的 Atom 持有者可以发送 `MsgVote` 交易来对提案进行投票。
+
+```protobuf reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/proto/cosmos/gov/v1/tx.proto#L92-L108
+```
+
+**状态修改:**
+
+* 记录发送者的 `Vote`
+
+:::note
+此消息的燃气成本必须考虑到在 EndBlocker 中对投票进行计算。
+:::
+
+接下来是处理 `MsgVote` 交易的伪代码概述：
+
+```go
+  // PSEUDOCODE //
+  // Check if MsgVote is valid. If it is, count vote//
+
+  upon receiving txGovVote from sender do
+    // check if proposal is correctly formatted. Includes fee payment.
+
+    if !correctlyFormatted(txGovDeposit)
+      throw
+
+    proposal = load(Proposals, <txGovDeposit.ProposalID|'proposal'>)
+
+    if (proposal == nil)
+      // There is no proposal for this proposalID
+      throw
+
+
+    if  (proposal.CurrentStatus == ProposalStatusActive)
+
+
+        // Sender can vote if
+        // Proposal is active
+        // Sender has some bonds
+
+        store(Governance, <txGovVote.ProposalID|'addresses'|sender>, txGovVote.Vote)   // Voters can vote multiple times. Re-voting overrides previous vote. This is ok because tallying is done once at the end.
+```
+
+## 事件
+
+治理模块会发出以下事件：
+
+### EndBlocker
+
+| 类型              | 属性键         | 属性值           |
+| ----------------- | --------------- | ---------------- |
+| inactive_proposal | proposal_id     | {proposalID}     |
+| inactive_proposal | proposal_result | {proposalResult} |
+| active_proposal   | proposal_id     | {proposalID}     |
+| active_proposal   | proposal_result | {proposalResult} |
+
+### 处理器
+
+#### MsgSubmitProposal
+
+| 类型                | 属性键             | 属性值         |
+| ------------------- | ------------------- | --------------- |
+| submit_proposal     | proposal_id         | {proposalID}    |
+| submit_proposal [0] | voting_period_start | {proposalID}    |
+| proposal_deposit    | amount              | {depositAmount} |
+| proposal_deposit    | proposal_id         | {proposalID}    |
+| message             | module              | governance      |
+| message             | action              | submit_proposal |
+| message             | sender              | {senderAddress} |
+
+* [0] 仅在投票期开始时提交时才会触发的事件。
+
+#### MsgVote
+
+| 类型          | 属性键         | 属性值         |
+| ------------- | ------------- | --------------- |
+| proposal_vote | option        | {voteOption}    |
+| proposal_vote | proposal_id   | {proposalID}    |
+| message       | module        | governance      |
+| message       | action        | vote            |
+| message       | sender        | {senderAddress} |
+
+#### MsgVoteWeighted
+
+| 类型          | 属性键         | 属性值               |
+| ------------- | ------------- | --------------------- |
+| proposal_vote | option        | {weightedVoteOptions} |
+| proposal_vote | proposal_id   | {proposalID}          |
+| message       | module        | governance            |
+| message       | action        | vote                  |
+| message       | sender        | {senderAddress}       |
+
+#### MsgDeposit
+
+| 类型                 | 属性键             | 属性值         |
+| -------------------- | ----------------- | --------------- |
+| proposal_deposit     | amount            | {depositAmount} |
+| proposal_deposit     | proposal_id       | {proposalID}    |
+| proposal_deposit [0] | voting_period_start | {proposalID}    |
+| message              | module            | governance      |
+| message              | action            | deposit         |
+| message              | sender            | {senderAddress} |
+
+* [0] 仅在投票期开始时提交时才会触发的事件。
+
+## 参数
+
+治理模块包含以下参数：
+
+| 键                           | 类型             | 示例                                 |
+| ----------------------------- | ---------------- | --------------------------------------- |
+| min_deposit                   | 数组 (coins)    | [{"denom":"uatom","amount":"10000000"}] |
+| max_deposit_period            | 字符串 (时间 ns) | "172800000000000" (17280s)              |
+| voting_period                 | 字符串 (时间 ns) | "172800000000000" (17280s)              |
+| quorum                        | 字符串 (十进制)     | "0.334000000000000000"                  |
+| threshold                     | 字符串 (十进制)     | "0.500000000000000000"                  |
+| veto                          | 字符串 (十进制)     | "0.334000000000000000"                  |
+| expedited_threshold           | 字符串 (时间 ns) | "0.667000000000000000"                  |
+| expedited_voting_period       | 字符串 (时间 ns) | "86400000000000" (8600s)                |
+| expedited_min_deposit         | 数组 (coins)    | [{"denom":"uatom","amount":"50000000"}] |
+| burn_proposal_deposit_prevote | 布尔值             | false                                   |
+| burn_vote_quorum              | 布尔值             | false                                   |
+| burn_vote_veto                | 布尔值             | true                                    |
+
+**注意**：治理模块包含的参数是对象，与其他模块不同。如果只想更改参数的子集，只需包含它们，而不是整个参数对象结构。
+
+## 客户端
+
+### 命令行界面（CLI）
+
+用户可以使用命令行界面（CLI）查询和与 `gov` 模块进行交互。
+
+#### 查询
+
+`query` 命令允许用户查询 `gov` 状态。
+
+```bash
+simd query gov --help
+```
+
+##### 存款
+
+`deposit` 命令允许用户查询给定提案的给定存款人的存款。
+
+```bash
+simd query gov deposit [proposal-id] [depositer-addr] [flags]
+```
+
+示例：
+
+```bash
+simd query gov deposit 1 cosmos1..
+```
+
+示例输出：
+
+```bash
+amount:
+- amount: "100"
+  denom: stake
+depositor: cosmos1..
+proposal_id: "1"
+```
+
+##### 存款列表
+
+`deposits` 命令允许用户查询给定提案的所有存款。
+
+```bash
+simd query gov deposits [proposal-id] [flags]
+```
+
+示例：
+
+```bash
+simd query gov deposits 1
+```
+
+示例输出：
+
+```bash
+deposits:
+- amount:
+  - amount: "100"
+    denom: stake
+  depositor: cosmos1..
+  proposal_id: "1"
+pagination:
+  next_key: null
+  total: "0"
+```
+
+##### 参数
+
+`param` 命令允许用户查询 `gov` 模块的给定参数。
+
+```bash
+simd query gov param [param-type] [flags]
+```
+
+示例：
+
+```bash
+simd query gov param voting
+```
+
+示例输出：
+
+```bash
+voting_period: "172800000000000"
+```
+
+##### 参数列表
+
+`params` 命令允许用户查询 `gov` 模块的所有参数。
+
+```bash
+simd query gov params [flags]
+```
+
+示例：
+
+```bash
+simd query gov params
+```
+
+示例输出：
+
+```bash
+deposit_params:
+  max_deposit_period: 172800s
+  min_deposit:
+  - amount: "10000000"
+    denom: stake
+params:
+  expedited_min_deposit:
+  - amount: "50000000"
+    denom: stake
+  expedited_threshold: "0.670000000000000000"
+  expedited_voting_period: 86400s
+  max_deposit_period: 172800s
+  min_deposit:
+  - amount: "10000000"
+    denom: stake
+  min_initial_deposit_ratio: "0.000000000000000000"
+  proposal_cancel_burn_rate: "0.500000000000000000"
+  quorum: "0.334000000000000000"
+  threshold: "0.500000000000000000"
+  veto_threshold: "0.334000000000000000"
+  voting_period: 172800s
+tally_params:
+  quorum: "0.334000000000000000"
+  threshold: "0.500000000000000000"
+  veto_threshold: "0.334000000000000000"
+voting_params:
+  voting_period: 172800s
+```
+
+##### 提案
+
+`proposal` 命令允许用户查询给定提案。
+
+```bash
+simd query gov proposal [proposal-id] [flags]
+```
+
+示例：
+
+```bash
+simd query gov proposal 1
+```
+
+示例输出：
+
+```bash
+deposit_end_time: "2022-03-30T11:50:20.819676256Z"
+final_tally_result:
+  abstain_count: "0"
+  no_count: "0"
+  no_with_veto_count: "0"
+  yes_count: "0"
+id: "1"
+messages:
+- '@type': /cosmos.bank.v1beta1.MsgSend
+  amount:
+  - amount: "10"
+    denom: stake
+  from_address: cosmos1..
+  to_address: cosmos1..
+metadata: AQ==
+status: PROPOSAL_STATUS_DEPOSIT_PERIOD
+submit_time: "2022-03-28T11:50:20.819676256Z"
+total_deposit:
+- amount: "10"
+  denom: stake
+voting_end_time: null
+voting_start_time: null
+```
+
+##### 提案列表
+
+`proposals` 命令允许用户查询所有提案，并可选择使用过滤器。
+
+```bash
+simd query gov proposals [flags]
+```
+
+示例：
+
+```bash
+simd query gov proposals
+```
+
+示例输出：
+
+```bash
+pagination:
+  next_key: null
+  total: "0"
+proposals:
+- deposit_end_time: "2022-03-30T11:50:20.819676256Z"
+  final_tally_result:
+    abstain_count: "0"
+    no_count: "0"
+    no_with_veto_count: "0"
+    yes_count: "0"
+  id: "1"
+  messages:
+  - '@type': /cosmos.bank.v1beta1.MsgSend
+    amount:
+    - amount: "10"
+      denom: stake
+    from_address: cosmos1..
+    to_address: cosmos1..
+  metadata: AQ==
+  status: PROPOSAL_STATUS_DEPOSIT_PERIOD
+  submit_time: "2022-03-28T11:50:20.819676256Z"
+  total_deposit:
+  - amount: "10"
+    denom: stake
+  voting_end_time: null
+  voting_start_time: null
+- deposit_end_time: "2022-03-30T14:02:41.165025015Z"
+  final_tally_result:
+    abstain_count: "0"
+    no_count: "0"
+    no_with_veto_count: "0"
+    yes_count: "0"
+  id: "2"
+  messages:
+  - '@type': /cosmos.bank.v1beta1.MsgSend
+    amount:
+    - amount: "10"
+      denom: stake
+    from_address: cosmos1..
+    to_address: cosmos1..
+  metadata: AQ==
+  status: PROPOSAL_STATUS_DEPOSIT_PERIOD
+  submit_time: "2022-03-28T14:02:41.165025015Z"
+  total_deposit:
+  - amount: "10"
+    denom: stake
+  voting_end_time: null
+  voting_start_time: null
+```
+
+##### 提案人
+
+`proposer` 命令允许用户查询给定提案的提案人。
+
+```bash
+simd query gov proposer [proposal-id] [flags]
+```
+
+##### 计票
+
+`计票` 命令允许用户查询给定提案投票的计票结果。
+
+```bash
+simd query gov tally [proposal-id] [flags]
+```
+
+示例：
+
+```bash
+simd query gov tally 1
+```
+
+示例输出：
+
+```bash
+abstain: "0"
+"no": "0"
+no_with_veto: "0"
+"yes": "1"
+```
+
+##### 投票
+
+`投票` 命令允许用户查询给定提案的投票情况。
+
+```bash
+simd query gov vote [proposal-id] [voter-addr] [flags]
+```
+
+示例：
+
+```bash
+simd query gov vote 1 cosmos1..
+```
+
+示例输出：
+
+```bash
+option: VOTE_OPTION_YES
+options:
+- option: VOTE_OPTION_YES
+  weight: "1.000000000000000000"
+proposal_id: "1"
+voter: cosmos1..
+```
+
+##### 投票列表
+
+`投票列表` 命令允许用户查询给定提案的所有投票。
+
+```bash
+simd query gov votes [proposal-id] [flags]
+```
+
+示例：
+
+```bash
+simd query gov votes 1
+```
+
+示例输出：
+
+```bash
+pagination:
+  next_key: null
+  total: "0"
+votes:
+- option: VOTE_OPTION_YES
+  options:
+  - option: VOTE_OPTION_YES
+    weight: "1.000000000000000000"
+  proposal_id: "1"
+  voter: cosmos1..
+```
+
+#### 交易
+
+`tx` 命令允许用户与 `gov` 模块进行交互。
+
+```bash
+simd tx gov --help
+```
+
+##### 存款
+
+`存款` 命令允许用户为给定提案存入代币。
+
+```bash
+simd tx gov deposit [proposal-id] [deposit] [flags]
+```
+
+示例：
+
+```bash
+simd tx gov deposit 1 10000000stake --from cosmos1..
+```
+
+##### 起草提案
+
+`起草提案` 命令允许用户起草任何类型的提案。
+该命令返回一个 `draft_proposal.json` 文件，完成后将由 `submit-proposal` 使用。
+`draft_metadata.json` 应上传到 [IPFS](#metadata)。
+
+```bash
+simd tx gov draft-proposal
+```
+
+##### 提交提案
+
+`提交提案` 命令允许用户提交一个带有一些消息和元数据的治理提案。
+消息、元数据和存款在一个 JSON 文件中定义。
+
+```bash
+simd tx gov submit-proposal [path-to-proposal-json] [flags]
+```
+
+示例：
+
+```bash
+simd tx gov submit-proposal /path/to/proposal.json --from cosmos1..
+```
+
+其中 `proposal.json` 包含：
+
+```json
+{
+  "messages": [
+    {
+      "@type": "/cosmos.bank.v1beta1.MsgSend",
+      "from_address": "cosmos1...", // The gov module module address
+      "to_address": "cosmos1...",
+      "amount":[{"denom": "stake","amount": "10"}]
+    }
+  ],
+  "metadata": "AQ==",
+  "deposit": "10stake",
+  "title": "Proposal Title",
+  "summary": "Proposal Summary"
+}
+```
+
+:::note
+默认情况下，元数据、摘要和标题都限制在255个字符以内，应用开发者可以覆盖此限制。
+:::
+
+##### submit-legacy-proposal
+
+`submit-legacy-proposal`命令允许用户提交一个带有初始存款的治理旧版提案。
+
+```bash
+simd tx gov submit-legacy-proposal [command] [flags]
+```
+
+示例：
+
+```bash
+simd tx gov submit-legacy-proposal --title="测试提案" --description="测试" --type="文本" --deposit="100000000stake" --from cosmos1..
+```
+
+示例（`param-change`）：
+
+```bash
+simd tx gov submit-legacy-proposal param-change proposal.json --from cosmos1..
+```
+
+```json
+{
+  "title": "Test Proposal",
+  "description": "testing, testing, 1, 2, 3",
+  "changes": [
+    {
+      "subspace": "staking",
+      "key": "MaxValidators",
+      "value": 100
+    }
+  ],
+  "deposit": "10000000stake"
+}
+```
+
+#### cancel-proposal
+
+一旦提案被取消，提案的存款 `deposits * proposal_cancel_ratio` 将被销毁或发送到 `ProposalCancelDest` 地址，如果 `ProposalCancelDest` 为空，则存款将被销毁。剩余的存款将被发送给存款人。
+
+```bash
+simd tx gov cancel-proposal [proposal-id] [flags]
+```
+
+示例：
+
+```bash
+simd tx gov cancel-proposal 1 --from cosmos1...
+```
+
+##### vote
+
+`vote`命令允许用户为给定的治理提案提交投票。
+
+```bash
+simd tx gov vote [command] [flags]
+```
+
+示例：
+
+```bash
+simd tx gov vote 1 yes --from cosmos1..
+```
+
+##### weighted-vote
+
+`weighted-vote`命令允许用户为给定的治理提案提交加权投票。
+
+```bash
+simd tx gov weighted-vote [proposal-id] [weighted-options] [flags]
+```
+
+示例：
+
+```bash
+simd tx gov weighted-vote 1 yes=0.5,no=0.5 --from cosmos1..
+```
+
+### gRPC
+
+用户可以使用 gRPC 端点查询 `gov` 模块。
+
+#### Proposal
+
+`Proposal` 端点允许用户查询给定的提案。
+
+使用旧版 v1beta1：
+
+```bash
+cosmos.gov.v1beta1.Query/Proposal
+```
+
+示例：
+
+```bash
+grpcurl -plaintext \
+    -d '{"proposal_id":"1"}' \
+    localhost:9090 \
+    cosmos.gov.v1beta1.Query/Proposal
+```
+
+示例输出：
+
+```bash
+{
+  "proposal": {
+    "proposalId": "1",
+    "content": {"@type":"/cosmos.gov.v1beta1.TextProposal","description":"testing, testing, 1, 2, 3","title":"Test Proposal"},
+    "status": "PROPOSAL_STATUS_VOTING_PERIOD",
+    "finalTallyResult": {
+      "yes": "0",
+      "abstain": "0",
+      "no": "0",
+      "noWithVeto": "0"
+    },
+    "submitTime": "2021-09-16T19:40:08.712440474Z",
+    "depositEndTime": "2021-09-18T19:40:08.712440474Z",
+    "totalDeposit": [
+      {
+        "denom": "stake",
+        "amount": "10000000"
+      }
+    ],
+    "votingStartTime": "2021-09-16T19:40:08.712440474Z",
+    "votingEndTime": "2021-09-18T19:40:08.712440474Z",
+    "title": "Test Proposal",
+    "summary": "testing, testing, 1, 2, 3"
+  }
+}
+```
+
+使用 v1：
+
+```bash
+cosmos.gov.v1.Query/Proposal
+```
+
+示例：
+
+```bash
+grpcurl -plaintext \
+    -d '{"proposal_id":"1"}' \
+    localhost:9090 \
+    cosmos.gov.v1.Query/Proposal
+```
+
+示例输出：
+
+```bash
+{
+  "proposal": {
+    "id": "1",
+    "messages": [
+      {"@type":"/cosmos.bank.v1beta1.MsgSend","amount":[{"denom":"stake","amount":"10"}],"fromAddress":"cosmos1..","toAddress":"cosmos1.."}
+    ],
+    "status": "PROPOSAL_STATUS_VOTING_PERIOD",
+    "finalTallyResult": {
+      "yesCount": "0",
+      "abstainCount": "0",
+      "noCount": "0",
+      "noWithVetoCount": "0"
+    },
+    "submitTime": "2022-03-28T11:50:20.819676256Z",
+    "depositEndTime": "2022-03-30T11:50:20.819676256Z",
+    "totalDeposit": [
+      {
+        "denom": "stake",
+        "amount": "10000000"
+      }
+    ],
+    "votingStartTime": "2022-03-28T14:25:26.644857113Z",
+    "votingEndTime": "2022-03-30T14:25:26.644857113Z",
+    "metadata": "AQ==",
+    "title": "Test Proposal",
+    "summary": "testing, testing, 1, 2, 3"
+  }
+}
+```
+
+#### Proposals
+
+`Proposals` 端点允许用户查询所有带有可选过滤器的提案。
+
+使用旧版 v1beta1：
+
+```bash
+cosmos.gov.v1beta1.Query/Proposals
+```
+
+#### 投票
+
+`Vote` 端点允许用户查询给定提案的投票。
+
+使用旧版 v1beta1：
+
+```bash
+cosmos.gov.v1beta1.Query/Vote
+```
+
+示例：
+
+```bash
+grpcurl -plaintext \
+    -d '{"proposal_id":"1","voter":"cosmos1.."}' \
+    localhost:9090 \
+    cosmos.gov.v1beta1.Query/Vote
+```
+
+示例输出：
+
+```bash
+{
+  "vote": {
+    "proposalId": "1",
+    "voter": "cosmos1..",
+    "option": "VOTE_OPTION_YES",
+    "options": [
+      {
+        "option": "VOTE_OPTION_YES",
+        "weight": "1000000000000000000"
+      }
+    ]
+  }
+}
+```
+
+使用 v1：
+
+```bash
+cosmos.gov.v1.Query/Vote
+```
+
+示例：
+
+```bash
+grpcurl -plaintext \
+    -d '{"proposal_id":"1","voter":"cosmos1.."}' \
+    localhost:9090 \
+    cosmos.gov.v1.Query/Vote
+```
+
+示例输出：
+
+```bash
+{
+  "vote": {
+    "proposalId": "1",
+    "voter": "cosmos1..",
+    "option": "VOTE_OPTION_YES",
+    "options": [
+      {
+        "option": "VOTE_OPTION_YES",
+        "weight": "1.000000000000000000"
+      }
+    ]
+  }
+}
+```
+
+#### 投票
+
+`Votes` 端点允许用户查询给定提案的所有投票。
+
+使用旧版 v1beta1：
+
+```bash
+cosmos.gov.v1beta1.Query/Votes
+```
+
+示例：
+
+```bash
+grpcurl -plaintext \
+    -d '{"proposal_id":"1"}' \
+    localhost:9090 \
+    cosmos.gov.v1beta1.Query/Votes
+```
+
+示例输出：
+
+```bash
+{
+  "votes": [
+    {
+      "proposalId": "1",
+      "voter": "cosmos1..",
+      "options": [
+        {
+          "option": "VOTE_OPTION_YES",
+          "weight": "1000000000000000000"
+        }
+      ]
+    }
+  ],
+  "pagination": {
+    "total": "1"
+  }
+}
+```
+
+使用 v1：
+
+```bash
+cosmos.gov.v1.Query/Votes
+```
+
+示例：
+
+```bash
+grpcurl -plaintext \
+    -d '{"proposal_id":"1"}' \
+    localhost:9090 \
+    cosmos.gov.v1.Query/Votes
+```
+
+示例输出：
+
+```bash
+{
+  "votes": [
+    {
+      "proposalId": "1",
+      "voter": "cosmos1..",
+      "options": [
+        {
+          "option": "VOTE_OPTION_YES",
+          "weight": "1.000000000000000000"
+        }
+      ]
+    }
+  ],
+  "pagination": {
+    "total": "1"
+  }
+}
+```
+
+#### 参数
+
+`Params` 端点允许用户查询 `gov` 模块的所有参数。
+
+<!-- TODO: #10197 查询治理参数输出空值 -->
+
+使用旧版 v1beta1：
+
+```bash
+cosmos.gov.v1beta1.Query/Params
+```
+
+示例：
+
+```bash
+grpcurl -plaintext \
+    -d '{"params_type":"voting"}' \
+    localhost:9090 \
+    cosmos.gov.v1beta1.Query/Params
+```
+
+示例输出：
+
+```bash
+{
+  "votingParams": {
+    "votingPeriod": "172800s"
+  },
+  "depositParams": {
+    "maxDepositPeriod": "0s"
+  },
+  "tallyParams": {
+    "quorum": "MA==",
+    "threshold": "MA==",
+    "vetoThreshold": "MA=="
+  }
+}
+```
+
+使用 v1：
+
+```bash
+cosmos.gov.v1.Query/Params
+```
+
+示例：
+
+```bash
+grpcurl -plaintext \
+    -d '{"params_type":"voting"}' \
+    localhost:9090 \
+    cosmos.gov.v1.Query/Params
+```
+
+示例输出：
+
+```bash
+{
+  "votingParams": {
+    "votingPeriod": "172800s"
+  }
+}
+```
+
+#### 存款
+
+`Deposit` 端点允许用户查询给定提案的给定存款人的存款。
+
+使用旧版 v1beta1：
+
+```bash
+cosmos.gov.v1beta1.Query/Deposit
+```
+
+示例：
+
+```bash
+grpcurl -plaintext \
+    '{"proposal_id":"1","depositor":"cosmos1.."}' \
+    localhost:9090 \
+    cosmos.gov.v1beta1.Query/Deposit
+```
+
+示例输出：
+
+```bash
+{
+  "deposit": {
+    "proposalId": "1",
+    "depositor": "cosmos1..",
+    "amount": [
+      {
+        "denom": "stake",
+        "amount": "10000000"
+      }
+    ]
+  }
+}
+```
+
+使用 v1：
+
+```bash
+cosmos.gov.v1.Query/Deposit
+```
+
+示例：
+
+```bash
+grpcurl -plaintext \
+    '{"proposal_id":"1","depositor":"cosmos1.."}' \
+    localhost:9090 \
+    cosmos.gov.v1.Query/Deposit
+```
+
+示例输出：
+
+```bash
+{
+  "deposit": {
+    "proposalId": "1",
+    "depositor": "cosmos1..",
+    "amount": [
+      {
+        "denom": "stake",
+        "amount": "10000000"
+      }
+    ]
+  }
+}
+```
+
+#### 存款
+
+`Deposits` 端点允许用户查询给定提案的所有存款。
+
+使用旧版 v1beta1：
+
+```bash
+cosmos.gov.v1beta1.Query/Deposits
+```
+
+示例：
+
+```bash
+grpcurl -plaintext \
+    -d '{"proposal_id":"1"}' \
+    localhost:9090 \
+    cosmos.gov.v1beta1.Query/Deposits
+```
+
+#### TallyResult
+
+`TallyResult`端点允许用户查询给定提案的计票结果。
+
+使用旧版v1beta1：
+
+```bash
+cosmos.gov.v1beta1.Query/TallyResult
+```
+
+示例：
+
+```bash
+grpcurl -plaintext \
+    -d '{"proposal_id":"1"}' \
+    localhost:9090 \
+    cosmos.gov.v1beta1.Query/TallyResult
+```
+
+示例输出：
+
+```bash
+{
+  "tally": {
+    "yes": "1000000",
+    "abstain": "0",
+    "no": "0",
+    "noWithVeto": "0"
+  }
+}
+```
+
+使用v1：
+
+```bash
+cosmos.gov.v1.Query/TallyResult
+```
+
+示例：
+
+```bash
+grpcurl -plaintext \
+    -d '{"proposal_id":"1"}' \
+    localhost:9090 \
+    cosmos.gov.v1.Query/TallyResult
+```
+
+#### REST
+
+用户可以使用REST端点查询`gov`模块。
+
+#### proposal
+
+`proposals`端点允许用户查询给定提案。
+
+使用旧版v1beta1：
+
+```bash
+/cosmos/gov/v1beta1/proposals/{proposal_id}
+```
+
+示例：
+
+```bash
+curl localhost:1317/cosmos/gov/v1beta1/proposals/1
+```
+
+示例输出：
+
+```bash
+{
+  "proposal": {
+    "proposal_id": "1",
+    "content": null,
+    "status": "PROPOSAL_STATUS_VOTING_PERIOD",
+    "final_tally_result": {
+      "yes": "0",
+      "abstain": "0",
+      "no": "0",
+      "no_with_veto": "0"
+    },
+    "submit_time": "2022-03-28T11:50:20.819676256Z",
+    "deposit_end_time": "2022-03-30T11:50:20.819676256Z",
+    "total_deposit": [
+      {
+        "denom": "stake",
+        "amount": "10000000010"
+      }
+    ],
+    "voting_start_time": "2022-03-28T14:25:26.644857113Z",
+    "voting_end_time": "2022-03-30T14:25:26.644857113Z"
+  }
+}
+```
+
+使用v1：
+
+```bash
+/cosmos/gov/v1/proposals/{proposal_id}
+```
+
+示例：
+
+```bash
+curl localhost:1317/cosmos/gov/v1/proposals/1
+```
+
+示例输出：
+
+```bash
+{
+  "proposal": {
+    "id": "1",
+    "messages": [
+      {
+        "@type": "/cosmos.bank.v1beta1.MsgSend",
+        "from_address": "cosmos1..",
+        "to_address": "cosmos1..",
+        "amount": [
+          {
+            "denom": "stake",
+            "amount": "10"
+          }
+        ]
+      }
+    ],
+    "status": "PROPOSAL_STATUS_VOTING_PERIOD",
+    "final_tally_result": {
+      "yes_count": "0",
+      "abstain_count": "0",
+      "no_count": "0",
+      "no_with_veto_count": "0"
+    },
+    "submit_time": "2022-03-28T11:50:20.819676256Z",
+    "deposit_end_time": "2022-03-30T11:50:20.819676256Z",
+    "total_deposit": [
+      {
+        "denom": "stake",
+        "amount": "10000000"
+      }
+    ],
+    "voting_start_time": "2022-03-28T14:25:26.644857113Z",
+    "voting_end_time": "2022-03-30T14:25:26.644857113Z",
+    "metadata": "AQ==",
+    "title": "Proposal Title",
+    "summary": "Proposal Summary"
+  }
+}
+```
+
+#### proposals
+
+`proposals`端点还允许用户查询所有提案，并可选择性地使用过滤器。
+
+使用旧版v1beta1：
+
+```bash
+/cosmos/gov/v1beta1/proposals
+```
+
+示例：
+
+```bash
+curl localhost:1317/cosmos/gov/v1beta1/proposals
+```
+
+示例输出：
+
+```bash
+{
+  "proposals": [
+    {
+      "proposal_id": "1",
+      "content": null,
+      "status": "PROPOSAL_STATUS_VOTING_PERIOD",
+      "final_tally_result": {
+        "yes": "0",
+        "abstain": "0",
+        "no": "0",
+        "no_with_veto": "0"
+      },
+      "submit_time": "2022-03-28T11:50:20.819676256Z",
+      "deposit_end_time": "2022-03-30T11:50:20.819676256Z",
+      "total_deposit": [
+        {
+          "denom": "stake",
+          "amount": "10000000"
+        }
+      ],
+      "voting_start_time": "2022-03-28T14:25:26.644857113Z",
+      "voting_end_time": "2022-03-30T14:25:26.644857113Z"
+    },
+    {
+      "proposal_id": "2",
+      "content": null,
+      "status": "PROPOSAL_STATUS_DEPOSIT_PERIOD",
+      "final_tally_result": {
+        "yes": "0",
+        "abstain": "0",
+        "no": "0",
+        "no_with_veto": "0"
+      },
+      "submit_time": "2022-03-28T14:02:41.165025015Z",
+      "deposit_end_time": "2022-03-30T14:02:41.165025015Z",
+      "total_deposit": [
+        {
+          "denom": "stake",
+          "amount": "10"
+        }
+      ],
+      "voting_start_time": "0001-01-01T00:00:00Z",
+      "voting_end_time": "0001-01-01T00:00:00Z"
+    }
+  ],
+  "pagination": {
+    "next_key": null,
+    "total": "2"
+  }
+}
+```
+
+使用v1：
+
+```bash
+/cosmos/gov/v1/proposals
+```
+
+示例：
+
+```bash
+curl localhost:1317/cosmos/gov/v1/proposals
+```
+
+示例输出：
+
+```bash
+{
+  "proposals": [
+    {
+      "id": "1",
+      "messages": [
+        {
+          "@type": "/cosmos.bank.v1beta1.MsgSend",
+          "from_address": "cosmos1..",
+          "to_address": "cosmos1..",
+          "amount": [
+            {
+              "denom": "stake",
+              "amount": "10"
+            }
+          ]
+        }
+      ],
+      "status": "PROPOSAL_STATUS_VOTING_PERIOD",
+      "final_tally_result": {
+        "yes_count": "0",
+        "abstain_count": "0",
+        "no_count": "0",
+        "no_with_veto_count": "0"
+      },
+      "submit_time": "2022-03-28T11:50:20.819676256Z",
+      "deposit_end_time": "2022-03-30T11:50:20.819676256Z",
+      "total_deposit": [
+        {
+          "denom": "stake",
+          "amount": "10000000010"
+        }
+      ],
+      "voting_start_time": "2022-03-28T14:25:26.644857113Z",
+      "voting_end_time": "2022-03-30T14:25:26.644857113Z",
+      "metadata": "AQ==",
+      "title": "Proposal Title",
+      "summary": "Proposal Summary"
+    },
+    {
+      "id": "2",
+      "messages": [
+        {
+          "@type": "/cosmos.bank.v1beta1.MsgSend",
+          "from_address": "cosmos1..",
+          "to_address": "cosmos1..",
+          "amount": [
+            {
+              "denom": "stake",
+              "amount": "10"
+            }
+          ]
+        }
+      ],
+      "status": "PROPOSAL_STATUS_DEPOSIT_PERIOD",
+      "final_tally_result": {
+        "yes_count": "0",
+        "abstain_count": "0",
+        "no_count": "0",
+        "no_with_veto_count": "0"
+      },
+      "submit_time": "2022-03-28T14:02:41.165025015Z",
+      "deposit_end_time": "2022-03-30T14:02:41.165025015Z",
+      "total_deposit": [
+        {
+          "denom": "stake",
+          "amount": "10"
+        }
+      ],
+      "voting_start_time": null,
+      "voting_end_time": null,
+      "metadata": "AQ==",
+      "title": "Proposal Title",
+      "summary": "Proposal Summary"
+    }
+  ],
+  "pagination": {
+    "next_key": null,
+    "total": "2"
+  }
+}
+```
+
+#### voter vote
+
+`votes`端点允许用户查询给定提案的投票。
+
+使用旧版v1beta1：
+
+```bash
+/cosmos/gov/v1beta1/proposals/{proposal_id}/votes/{voter}
+```
+
+示例：
+
+```bash
+curl localhost:1317/cosmos/gov/v1beta1/proposals/1/votes/cosmos1..
+```
+
+示例输出：
+
+```bash
+{
+  "vote": {
+    "proposal_id": "1",
+    "voter": "cosmos1..",
+    "option": "VOTE_OPTION_YES",
+    "options": [
+      {
+        "option": "VOTE_OPTION_YES",
+        "weight": "1.000000000000000000"
+      }
+    ]
+  }
+}
+```
+
+使用v1：
+
+```bash
+/cosmos/gov/v1/proposals/{proposal_id}/votes/{voter}
+```
+
+示例：
+
+```bash
+curl localhost:1317/cosmos/gov/v1/proposals/1/votes/cosmos1..
+```
+
+#### 投票
+
+`votes` 端点允许用户查询给定提案的所有投票。
+
+使用旧版 v1beta1：
+
+```bash
+/cosmos/gov/v1beta1/proposals/{proposal_id}/votes
+```
+
+示例：
+
+```bash
+curl localhost:1317/cosmos/gov/v1beta1/proposals/1/votes
+```
+
+示例输出：
+
+```bash
+{
+  "votes": [
+    {
+      "proposal_id": "1",
+      "voter": "cosmos1..",
+      "option": "VOTE_OPTION_YES",
+      "options": [
+        {
+          "option": "VOTE_OPTION_YES",
+          "weight": "1.000000000000000000"
+        }
+      ]
+    }
+  ],
+  "pagination": {
+    "next_key": null,
+    "total": "1"
+  }
+}
+```
+
+使用 v1：
+
+```bash
+/cosmos/gov/v1/proposals/{proposal_id}/votes
+```
+
+示例：
+
+```bash
+curl localhost:1317/cosmos/gov/v1/proposals/1/votes
+```
+
+示例输出：
+
+```bash
+{
+  "votes": [
+    {
+      "proposal_id": "1",
+      "voter": "cosmos1..",
+      "options": [
+        {
+          "option": "VOTE_OPTION_YES",
+          "weight": "1.000000000000000000"
+        }
+      ],
+      "metadata": ""
+    }
+  ],
+  "pagination": {
+    "next_key": null,
+    "total": "1"
+  }
+}
+```
+
+#### 参数
+
+`params` 端点允许用户查询 `gov` 模块的所有参数。
+
+<!-- TODO: #10197 查询治理参数输出空值 -->
+
+使用旧版 v1beta1：
+
+```bash
+/cosmos/gov/v1beta1/params/{params_type}
+```
+
+示例：
+
+```bash
+curl localhost:1317/cosmos/gov/v1beta1/params/voting
+```
+
+示例输出：
+
+```bash
+{
+  "voting_params": {
+    "voting_period": "172800s"
+  },
+  "deposit_params": {
+    "min_deposit": [
+    ],
+    "max_deposit_period": "0s"
+  },
+  "tally_params": {
+    "quorum": "0.000000000000000000",
+    "threshold": "0.000000000000000000",
+    "veto_threshold": "0.000000000000000000"
+  }
+}
+```
+
+使用 v1：
+
+```bash
+/cosmos/gov/v1/params/{params_type}
+```
+
+示例：
+
+```bash
+curl localhost:1317/cosmos/gov/v1/params/voting
+```
+
+示例输出：
+
+```bash
+{
+  "voting_params": {
+    "voting_period": "172800s"
+  },
+  "deposit_params": {
+    "min_deposit": [
+    ],
+    "max_deposit_period": "0s"
+  },
+  "tally_params": {
+    "quorum": "0.000000000000000000",
+    "threshold": "0.000000000000000000",
+    "veto_threshold": "0.000000000000000000"
+  }
+}
+```
+
+#### 存款
+
+`deposits` 端点允许用户查询给定提案的给定存款人的存款。
+
+使用旧版 v1beta1：
+
+```bash
+/cosmos/gov/v1beta1/proposals/{proposal_id}/deposits/{depositor}
+```
+
+示例：
+
+```bash
+curl localhost:1317/cosmos/gov/v1beta1/proposals/1/deposits/cosmos1..
+```
+
+示例输出：
+
+```bash
+{
+  "deposit": {
+    "proposal_id": "1",
+    "depositor": "cosmos1..",
+    "amount": [
+      {
+        "denom": "stake",
+        "amount": "10000000"
+      }
+    ]
+  }
+}
+```
+
+使用 v1：
+
+```bash
+/cosmos/gov/v1/proposals/{proposal_id}/deposits/{depositor}
+```
+
+示例：
+
+```bash
+curl localhost:1317/cosmos/gov/v1/proposals/1/deposits/cosmos1..
+```
+
+示例输出：
+
+```bash
+{
+  "deposit": {
+    "proposal_id": "1",
+    "depositor": "cosmos1..",
+    "amount": [
+      {
+        "denom": "stake",
+        "amount": "10000000"
+      }
+    ]
+  }
+}
+```
+
+#### 提案存款
+
+`deposits` 端点允许用户查询给定提案的所有存款。
+
+使用旧版 v1beta1：
+
+```bash
+/cosmos/gov/v1beta1/proposals/{proposal_id}/deposits
+```
+
+示例：
+
+```bash
+curl localhost:1317/cosmos/gov/v1beta1/proposals/1/deposits
+```
+
+示例输出：
+
+```bash
+{
+  "deposits": [
+    {
+      "proposal_id": "1",
+      "depositor": "cosmos1..",
+      "amount": [
+        {
+          "denom": "stake",
+          "amount": "10000000"
+        }
+      ]
+    }
+  ],
+  "pagination": {
+    "next_key": null,
+    "total": "1"
+  }
+}
+```
+
+使用 v1：
+
+```bash
+/cosmos/gov/v1/proposals/{proposal_id}/deposits
+```
+
+#### 投票结果
+
+`tally` 端点允许用户查询给定提案的投票结果。
+
+使用旧版 v1beta1：
+
+```bash
+/cosmos/gov/v1beta1/proposals/{proposal_id}/tally
+```
+
+示例：
+
+```bash
+curl localhost:1317/cosmos/gov/v1beta1/proposals/1/tally
+```
+
+示例输出：
+
+```bash
+{
+  "tally": {
+    "yes": "1000000",
+    "abstain": "0",
+    "no": "0",
+    "no_with_veto": "0"
+  }
+}
+```
+
+使用 v1：
+
+```bash
+/cosmos/gov/v1/proposals/{proposal_id}/tally
+```
+
+示例：
+
+```bash
+curl localhost:1317/cosmos/gov/v1/proposals/1/tally
+```
+
+示例输出：
+
+```bash
+{
+  "tally": {
+    "yes": "1000000",
+    "abstain": "0",
+    "no": "0",
+    "no_with_veto": "0"
+  }
+}
+```
+
+## 元数据
+
+gov 模块有两个位置用于元数据，用户可以在其中提供关于他们正在进行的链上操作的进一步上下文。默认情况下，所有元数据字段都有一个 255 字符长度的字段，元数据可以以 json 格式存储，根据所需的数据量，可以存储在链上或链下。在这里，我们提供了一个关于 json 结构和数据存储位置的建议。在这些建议中有两个重要因素。首先，gov 和 group 模块之间的一致性，注意所有组织提出的提案数量可能非常大。其次，客户端应用程序（如区块浏览器和治理界面）对元数据结构的一致性有信心。
+
+### 提案
+
+位置：链下，作为存储在 IPFS 上的 json 对象（镜像 [group proposal](../group/README.md#metadata)）
+
+```json
+{
+  "title": "",
+  "authors": [""],
+  "summary": "",
+  "details": "",
+  "proposal_forum_url": "",
+  "vote_option_context": "",
+}
+```
+
+:::note
+`authors` 字段是一个字符串数组，这是为了允许在元数据中列出多个作者。在 v0.46 中，`authors` 字段是一个逗号分隔的字符串。前端应支持两种格式以实现向后兼容。
+:::
+
+### 投票
+
+位置：链上，作为 255 字符限制内的 json（镜像 [group vote](../group/README.md#metadata)）
+
+```json
+{
+  "justification": "",
+}
+```
+
+## 未来改进
+
+当前文档仅描述了治理模块的最小可行产品。未来的改进可能包括：
+
+* **`BountyProposals`:** 如果被接受，`BountyProposal` 将创建一个开放的赏金。`BountyProposal` 指定了完成后将提供多少个 Atoms。这些 Atoms 将从 `reserve pool` 中获取。在 `BountyProposal` 被治理接受后，任何人都可以提交一个带有代码的 `SoftwareUpgradeProposal` 来领取赏金。请注意，一旦 `BountyProposal` 被接受，`reserve pool` 中对应的资金将被锁定，以确保付款始终能够兑现。为了将 `SoftwareUpgradeProposal` 与开放的赏金关联起来，`SoftwareUpgradeProposal` 的提交者将使用 `Proposal.LinkedProposal` 属性。如果与开放的赏金关联的 `SoftwareUpgradeProposal` 被治理接受，预留的资金将自动转移到提交者账户。
+
+* **复杂委托：** 委托人可以选择除其验证者以外的其他代表。最终，代表链总是会以一个验证者结束，但委托人可以在继承其验证者的投票之前继承其选择的代表的投票。换句话说，只有在其其他指定的代表未投票时，他们才会继承其验证者的投票权。
+
+* **更好的提案审查流程：** `proposal.Deposit` 将分为两部分，一部分用于防止垃圾提案（与 MVP 中相同），另一部分用于奖励第三方审计人员。
+
+
 
 
 # `x/gov`

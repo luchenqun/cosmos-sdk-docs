@@ -1,3 +1,94 @@
+# 区块链架构简介
+
+## 状态机
+
+在其核心，区块链是一个[复制的确定性状态机](https://en.wikipedia.org/wiki/State_machine_replication)。
+
+状态机是计算机科学的概念，其中一台机器可以有多个状态，但在任何给定时间只能有一个状态。有一个`状态`，描述系统的当前状态，和`交易`，触发状态转换。
+
+给定一个状态S和一个交易T，状态机将返回一个新的状态S'。
+
+```text
++--------+                 +--------+
+|        |                 |        |
+|   S    +---------------->+   S'   |
+|        |    apply(T)     |        |
++--------+                 +--------+
+```
+
+在实践中，交易被打包成块以使过程更高效。给定一个状态S和一个交易块B，状态机将返回一个新的状态S'。
+
+```text
++--------+                              +--------+
+|        |                              |        |
+|   S    +----------------------------> |   S'   |
+|        |   For each T in B: apply(T)  |        |
++--------+                              +--------+
+```
+
+在区块链上下文中，状态机是确定性的。这意味着如果一个节点在给定的状态下启动并重放相同的交易序列，它将始终以相同的最终状态结束。
+
+Cosmos SDK为开发人员提供了最大的灵活性，以定义其应用程序的状态、交易类型和状态转换函数。在接下来的章节中，将更深入地描述使用Cosmos SDK构建状态机的过程。但首先，让我们看看如何使用**CometBFT**复制状态机。
+
+## CometBFT
+
+由于Cosmos SDK的存在，开发人员只需定义状态机，[*CometBFT*](https://docs.cometbft.com/v0.37/introduction/what-is-cometbft)将为他们处理网络复制。
+
+```text
+                ^  +-------------------------------+  ^
+                |  |                               |  |   Built with Cosmos SDK
+                |  |  State-machine = Application  |  |
+                |  |                               |  v
+                |  +-------------------------------+
+                |  |                               |  ^
+Blockchain node |  |           Consensus           |  |
+                |  |                               |  |
+                |  +-------------------------------+  |   CometBFT
+                |  |                               |  |
+                |  |           Networking          |  |
+                |  |                               |  |
+                v  +-------------------------------+  v
+```
+
+[CometBFT](https://docs.cometbft.com/v0.37/introduction/what-is-cometbft)是一个与应用程序无关的引擎，负责处理区块链的*网络*和*共识*层。在实践中，这意味着CometBFT负责传播和排序交易字节。CometBFT依赖于一种名为拜占庭容错（BFT）的算法来就交易顺序达成共识。
+
+CometBFT的[共识算法](https://docs.cometbft.com/v0.37/introduction/what-is-cometbft#consensus-overview)与一组称为*验证者*的特殊节点一起工作。验证者负责将交易块添加到区块链中。在任何给定的块中，都有一个验证者集合V。算法选择V中的一个验证者作为下一个块的提议者。如果超过V的三分之二对其进行了`prevote`和`precommit`的签名，并且其中包含的所有交易都是有效的，则该块被视为有效。验证者集合可以通过状态机中编写的规则进行更改。
+
+## ABCI
+
+CometBFT通过一个称为[ABCI](https://docs.cometbft.com/v0.37/spec/abci/)的接口将交易传递给应用程序，应用程序必须实现该接口。
+
+```text
+              +---------------------+
+              |                     |
+              |     Application     |
+              |                     |
+              +--------+---+--------+
+                       ^   |
+                       |   | ABCI
+                       |   v
+              +--------+---+--------+
+              |                     |
+              |                     |
+              |       CometBFT      |
+              |                     |
+              |                     |
+              +---------------------+
+```
+
+请注意，**CometBFT仅处理交易字节**。它不知道这些字节的含义。CometBFT所做的只是有序地处理这些交易字节。CometBFT通过ABCI将字节传递给应用程序，并期望返回代码来通知它交易中包含的消息是否成功处理。
+
+以下是ABCI的最重要的消息：
+
+* `CheckTx`：当CometBFT接收到一个交易时，它会将其传递给应用程序以检查是否满足一些基本要求。`CheckTx`用于保护全节点的内存池免受垃圾交易的影响。一个特殊的处理程序称为[`AnteHandler`](../high-level-concepts/04-gas-fees.md#antehandler)用于执行一系列验证步骤，例如检查足够的费用和验证签名。如果检查有效，则将交易添加到[mempool](https://docs.cometbft.com/v0.37/spec/p2p/messages/mempool)并传递给对等节点。请注意，使用`CheckTx`时不会处理交易（即不会修改状态），因为它们尚未包含在块中。
+* `DeliverTx`：当CometBFT接收到一个[有效的块](https://docs.cometbft.com/v0.37/spec/core/data_structures#block)时，块中的每个交易都通过`DeliverTx`传递给应用程序以进行处理。在此阶段发生状态转换。`AnteHandler`再次执行，同时对于交易中的每个消息，还会执行实际的[`Msg`服务](../../integrate/building-modules/03-msg-services.md) RPC。
+* `BeginBlock`/`EndBlock`：这些消息在每个块的开始和结束时执行，无论该块是否包含交易。它有助于触发逻辑的自动执行。但请谨慎操作，因为计算密集型的循环可能会减慢您的区块链，甚至如果循环是无限的话，可能会导致它冻结。
+
+从[CometBFT文档](https://docs.cometbft.com/v0.37/spec/abci/)中找到ABCI方法的更详细视图。
+
+任何构建在CometBFT上的应用程序都需要实现ABCI接口，以便与底层的本地CometBFT引擎进行通信。幸运的是，您不需要自己实现ABCI接口。Cosmos SDK以[baseapp](03-sdk-design.md#baseapp)的形式提供了一个ABCI接口的样板实现。
+
+
 # Introduction to Blockchain Architecture
 
 ## State machine

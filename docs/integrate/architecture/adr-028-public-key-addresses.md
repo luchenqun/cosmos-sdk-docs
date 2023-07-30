@@ -1,3 +1,332 @@
+# ADR 028: 公钥地址
+
+## 更新日志
+
+* 2020/08/18: 初始版本
+* 2021/01/15: 分析和算法更新
+
+## 状态
+
+建议中
+
+## 摘要
+
+本ADR定义了适用于所有可寻址的Cosmos SDK账户的地址格式。这包括：新的公钥算法、多重签名公钥和模块账户。
+
+## 背景
+
+问题[\#3685](https://github.com/cosmos/cosmos-sdk/issues/3685)指出，公钥地址空间目前存在重叠。我们确认这严重降低了Cosmos SDK的安全性。
+
+### 问题
+
+攻击者可以控制地址生成函数的输入。这导致了生日攻击，严重降低了安全空间。为了克服这个问题，我们需要将不同类型账户的输入分开：一个账户类型的安全性破坏不应影响其他账户类型的安全性。
+
+### 初始提案
+
+一个初始提案是扩展地址长度，并为不同类型的地址添加前缀。
+
+@ethanfrey解释了一个曾在https://github.com/iov-one/weave中使用的替代方法：
+
+> 在构建weave时，我花了很多时间思考这个问题...另一个cosmos Sdk。基本上，我将条件定义为一种类型，并以可读的字符串格式附加一些二进制数据。这个条件被哈希成一个地址（再次为20字节）。使用这个前缀使得无法找到一个具有不同条件的给定地址的原像（例如ed25519与secp256k1）。
+> 这在这里有详细解释https://weave.readthedocs.io/en/latest/design/permissions.html
+> 代码在这里，主要看我们处理条件的顶部。https://github.com/iov-one/weave/blob/master/conditions.go
+
+并解释了这种方法应该具有足够的碰撞抗性：
+
+> 是的，据我所知，当原像是唯一的且不可塑时，20字节应该具有碰撞抗性。在2^160的空间中，预计在2^80个元素（生日悖论）左右会出现一些碰撞。如果你想为数据库中的某个现有元素找到一个碰撞，仍然是2^160。只有当原像中没有不同类型信息时（在哈希成地址之前），才会出现这个问题。
+> 如果20字节空间对安全性是一个实际问题，我希望听到一个论点，因为我很乐意在weave中增加我的地址大小。我只是觉得cosmos、ethereum和bitcoin都使用了20字节，应该足够好了。而且上面的论点让我觉得它是安全的。但我没有进行更深入的分析。
+
+这导致了第一个提案（我们证明不够好）：我们将一个密钥类型与一个公钥连接起来，对其进行哈希处理，并取该哈希的前20个字节，简称为`sha256(keyTypePrefix || keybytes)[:20]`。
+
+### 回顾和讨论
+
+在 [\#5694](https://github.com/cosmos/cosmos-sdk/issues/5694) 中，我们讨论了各种解决方案。我们一致认为20个字节不具备未来的可扩展性，扩展地址长度是允许不同类型地址、不同签名类型等的唯一方法。这使得最初的提案不合格。
+
+在该问题中，我们讨论了各种修改：
+
+* 哈希函数的选择。
+* 将前缀移出哈希函数：`keyTypePrefix + sha256(keybytes)[:20]` [post-hash-prefix-proposal]。
+* 使用双重哈希：`sha256(keyTypePrefix + sha256(keybytes)[:20])`。
+* 将密钥字节哈希切片从20字节增加到32或40字节。我们得出结论，由良好的哈希函数生成的32字节是未来可靠的。
+
+### 要求
+
+* 支持当前使用的工具 - 我们不希望破坏生态系统，或者增加长时间的适应期。参考：https://github.com/cosmos/cosmos-sdk/issues/8041
+* 尽量保持地址长度较小 - 地址在状态中被广泛使用，既作为键的一部分，也作为对象值的一部分。
+
+### 范围
+
+此 ADR 仅定义了生成地址字节的过程。对于与地址的最终用户交互（通过 API、CLI 等），我们仍然使用 bech32 将这些地址格式化为字符串。此 ADR 不会改变这一点。
+使用 Bech32 进行字符串编码为我们提供了对校验和错误代码的支持以及处理用户输入错误的能力。
+
+## 决策
+
+我们定义了以下账户类型，并为其定义了地址函数：
+
+1. 简单账户：由常规公钥表示（例如：secp256k1、sr25519）
+2. 简单多签：由其他可寻址对象组成的账户（例如：简单多签）
+3. 由本地地址密钥组成的组合账户（例如：bls、组模块账户）
+4. 模块账户：基本上是任何不能签署交易且由模块内部管理的账户
+
+### 传统公钥地址不会改变
+
+目前（2021年1月），官方仅支持 Cosmos SDK 用户账户的是 `secp256k1` 基本账户和传统的 amino 多签账户。
+它们用于现有的 Cosmos SDK 区域。它们使用以下地址格式：
+
+* secp256k1：`ripemd160(sha256(pk_bytes))[:20]`
+* 传统的 amino 多签：`sha256(aminoCdc.Marshal(pk))[:20]`
+
+我们不希望改变现有的地址。因此，这两种密钥类型的地址将保持不变。
+
+当前的多签公钥使用 amino 序列化来生成地址。我们将保留这些公钥及其地址格式，并在协议缓冲区中称之为“传统的 amino”多签公钥。我们还将创建不带 amino 地址的多签公钥，下面将对其进行描述。
+
+### 哈希函数选择
+
+与 Cosmos SDK 的其他部分一样，我们将使用 `sha256`。
+
+### 基本地址
+
+我们首先定义一个用于生成地址的基本算法，我们将其称为 `Hash`。值得注意的是，它用于由单个密钥对表示的账户。对于每个公钥模式，我们必须有一个关联的 `typ` 字符串，下一节将对其进行解释。`hash` 是前一节中定义的密码哈希函数。
+
+```go
+const A_LEN = 32
+
+func Hash(typ string, key []byte) []byte {
+    return hash(hash(typ) + key)[:A_LEN]
+}
+```
+
+`+` 是字节串连接符，不使用任何分隔符。
+
+这个算法是与专业密码学家进行磋商会议的结果。
+动机：该算法使地址保持相对较小（`typ` 的长度不会影响最终地址的长度），并且比 [post-hash-prefix-proposal] 更安全（后者使用公钥哈希的前20个字节，显著减小了地址空间）。
+此外，密码学家还提出了在哈希中添加 `typ` 的选择，以防止切换表攻击。
+
+`address.Hash` 是一个用于为新的密钥类型生成 _基本_ 地址的低级函数。示例：
+
+* BLS：`address.Hash("bls", pubkey)`
+
+### 组合地址
+
+对于简单的组合账户（例如新的简单多签账户），我们将 `address.Hash` 进行了泛化。通过递归地为子账户创建地址，对地址进行排序并将它们组合成一个单一的地址。这确保了密钥的排序不会影响最终的地址。
+
+```go
+// We don't need a PubKey interface - we need anything which is addressable.
+type Addressable interface {
+    Address() []byte
+}
+
+func Composed(typ string, subaccounts []Addressable) []byte {
+    addresses = map(subaccounts, \a -> LengthPrefix(a.Address()))
+    addresses = sort(addresses)
+    return address.Hash(typ, addresses[0] + ... + addresses[n])
+}
+```
+
+`typ`参数应该是一个模式描述符，包含所有重要的属性，并具有确定性序列化（例如：utf8字符串）。
+`LengthPrefix`是一个函数，它在地址前面添加1个字节。该字节的值是在添加前的地址位的长度。地址的长度最多为255位。
+我们使用`LengthPrefix`来消除冲突 - 它确保对于两个地址列表：`as = {a1, a2, ..., an}`和`bs = {b1, b2, ..., bm}`，其中每个`bi`和`ai`最多为255位长，`concatenate(map(as, (a) => LengthPrefix(a))) = map(bs, (b) => LengthPrefix(b))`如果`as = bs`。
+
+实现提示：账户实现应该缓存地址。
+
+#### 多重签名地址
+
+对于新的多重签名公钥，我们不基于任何编码方案（amino或protobuf）来定义`typ`参数。这避免了编码方案中的非确定性问题。
+
+示例：
+
+```protobuf
+package cosmos.crypto.multisig;
+
+message PubKey {
+  uint32 threshold = 1;
+  repeated google.protobuf.Any pubkeys = 2;
+}
+```
+
+```go
+func (multisig PubKey) Address() {
+	// first gather all nested pub keys
+	var keys []address.Addressable  // cryptotypes.PubKey implements Addressable
+	for _, _key := range multisig.Pubkeys {
+		keys = append(keys, key.GetCachedValue().(cryptotypes.PubKey))
+	}
+
+	// form the type from the message name (cosmos.crypto.multisig.PubKey) and the threshold joined together
+	prefix := fmt.Sprintf("%s/%d", proto.MessageName(multisig), multisig.Threshold)
+
+	// use the Composed function defined above
+	return address.Composed(prefix, keys)
+}
+```
+
+
+### 派生地址
+
+我们必须能够从一个地址派生出另一个地址。派生过程必须保证哈希属性，因此我们使用已定义的`Hash`函数：
+
+```go
+func Derive(address, derivationKey []byte) []byte {
+	return Hash(addres, derivationKey)
+}
+```
+
+### 模块账户地址
+
+模块账户将具有`"module"`类型。模块账户可以有子账户。子模块账户将根据模块名称和派生密钥序列创建。通常，第一个派生密钥应该是派生账户的类别。派生过程有一个定义好的顺序：模块名称，子模块密钥，子子模块密钥... 使用以下方式创建示例模块账户：
+
+```go
+address.Module(moduleName, key)
+```
+
+使用以下方式创建示例子模块账户：
+
+```go
+groupPolicyAddresses := []byte{1}
+address.Module(moduleName, groupPolicyAddresses, policyID)
+```
+
+`address.Module`函数使用`address.Hash`，类型参数为`"module"`，以及模块名称的字节表示与子模块密钥连接起来。最后两个组件必须唯一分隔，以避免潜在的冲突（例如：modulename="ab"和submodulekey="bc"将具有与modulename="a"和submodulekey="bbc"相同的派生密钥）。我们使用空字节（`'\x00'`）来将模块名称与子模块密钥分隔开。这是可行的，因为空字节不是有效模块名称的一部分。最后，通过递归应用`Derive`函数来创建子子模块账户。
+我们也可以在第一步中使用`Derive`函数（而不是将模块名称与零字节和子模块密钥连接起来）。我们决定进行连接以避免一级派生并加快计算速度。
+
+为了与现有的 `authtypes.NewModuleAddress` 向后兼容，我们在 `Module` 函数中添加了一个特殊情况：当没有提供派生密钥时，我们回退到“传统”的实现。
+
+```go
+func Module(moduleName string, derivationKeys ...[]byte) []byte{
+	if len(derivationKeys) == 0 {
+		return authtypes.NewModuleAddress(modulenName)  // legacy case
+	}
+	submoduleAddress := Hash("module", []byte(moduleName) + 0 + key)
+	return fold((a, k) => Derive(a, k), subsubKeys, submoduleAddress)
+}
+```
+
+**示例 1**  一个借贷 BTC 池地址可以是：
+
+```go
+btcPool := address.Module("lending", btc.Address()})
+```
+
+如果我们想要为一个依赖于多个密钥的模块账户创建一个地址，我们可以将它们连接起来：
+
+```go
+btcAtomAMM := address.Module("amm", btc.Address() + atom.Address()})
+```
+
+**示例 2**  一个智能合约地址可以构建如下：
+
+```go
+smartContractAddr = Module("mySmartContractVM", smartContractsNamespace, smartContractKey})
+
+// which equals to:
+smartContractAddr = Derived(
+    Module("mySmartContractVM", smartContractsNamespace), 
+    []{smartContractKey})
+```
+
+### Schema 类型
+
+在 `Hash` 函数中使用的 `typ` 参数应该对于每个账户类型是唯一的。
+由于所有 Cosmos SDK 账户类型都被序列化在状态中，我们建议使用 protobuf 消息名称字符串。
+
+示例：所有公钥类型都有一个类似于以下的唯一 protobuf 消息类型：
+
+```protobuf
+package cosmos.crypto.sr25519;
+
+message PubKey {
+	bytes key = 1;
+}
+```
+
+所有 protobuf 消息都有唯一的完全限定名称，在这个示例中是 `cosmos.crypto.sr25519.PubKey`。
+这些名称直接从 .proto 文件中派生，并以标准化的方式在其他地方使用，比如 `Any` 中的类型 URL。我们可以使用 `proto.MessageName(msg)` 轻松获取名称。
+
+## 结果
+
+### 向后兼容性
+
+这个 ADR 与 Cosmos SDK 存储库中提交的内容兼容，并得到直接支持。
+
+### 积极影响
+
+* 为新的公钥、复杂账户和模块生成地址的简单算法
+* 该算法概括了“本地组合密钥”
+* 增加了地址的安全性和冲突抵抗能力
+* 这种方法在未来的用例中是可扩展的 - 只要它们不与此处指定的地址长度（20 或 32 字节）冲突，可以使用其他地址类型。
+* 支持新的账户类型。
+
+### 负面影响
+
+* 地址不会传达密钥类型，前缀方法可以做到这一点
+* 地址长度增加了 60%，将占用更多的存储空间
+* 需要重构 KVStore 存储键以处理可变长度的地址
+
+### 中性
+
+* protobuf 消息名称被用作键类型前缀
+
+## 进一步讨论
+
+一些账户可以有一个固定的名称，或者可以以其他方式构建（例如：模块）。我们正在讨论一个预定义名称的账户的想法（例如：`me.regen`），这个账户可以被机构使用。
+不详细讨论，只要这些地址的长度不相同，这些特殊账户地址与此处描述的基于哈希的地址是兼容的。
+更具体地说，任何特殊账户地址的长度不能等于20或32字节。
+
+## 附录：咨询会议
+
+2020年12月底，我们与[Alan Szepieniec](https://scholar.google.be/citations?user=4LyZn8oAAAAJ&hl=en)进行了一次会议，咨询了上述方法。
+
+Alan的一般观察：
+
+* 我们不需要2次原像抗性
+* 我们需要32字节的地址空间来进行碰撞抗性
+* 当攻击者可以控制一个带有地址的对象的输入时，我们就会遇到生日攻击的问题
+* 哈希的智能合约存在问题
+* sha2挖矿可以用来破解地址的原像
+
+哈希算法
+
+* 任何破解blake3的攻击都会破解blake2
+* Alan对blake哈希算法的当前安全分析非常有信心。它是一个决赛选手，作者在安全分析领域很有名。
+
+算法：
+
+* Alan建议对前缀进行哈希：`address(pub_key) = hash(hash(key_type) + pub_key)[:32]`，主要好处：
+    * 我们可以自由地使用任意长的前缀名称
+    * 我们仍然不会有碰撞的风险
+    * 切换表格
+* 关于惩罚的讨论 -> 在哈希后添加前缀
+* Aaron问到了后哈希前缀（`address(pub_key) = key_type + hash(pub_key)`）和区别。Alan指出，这种方法具有更长的地址空间，并且更强大。
+
+复杂/组合密钥的算法：
+
+* 使用相同算法合并类似树状的地址是可以的
+
+模块地址：模块地址是否应该具有不同的大小以区分它们？
+
+* 我们需要为模块地址设置一个前像前缀，以保持它们在32字节空间中：`hash(hash('module') + module_key)`
+* Aaron观察：我们已经需要处理可变长度（以不破坏secp256k1密钥）。
+
+关于零知识证明的算术哈希函数的讨论
+
+* Posseidon / Rescue
+* 问题：由于我们对算术构造的密码分析技术和历史了解有限，风险更大。这仍然是一个新的领域，正在积极研究中。
+
+后量子签名大小
+
+* Alan建议：Falcon：速度/大小比例非常好。
+* Aaron - 我们应该考虑吗？
+  Alan：根据早期推测，这个东西将在2050年能够破解椭圆曲线密码学。但是这有很多不确定性。但是递归/链接/模拟中有一些神奇的事情发生，可以加快进展。
+
+其他想法
+
+* 假设我们对于两个不同的用例使用相同的密钥和两种不同的地址算法。这样使用还安全吗？Alan：如果我们想隐藏公钥（这不是我们的用例），那么安全性会降低，但是有解决方法。
+
+### 参考资料
+
+* [笔记](https://hackmd.io/_NGWI4xZSbKzj1BkCqyZMw)
+
+
 # ADR 028: Public Key Addresses
 
 ## Changelog

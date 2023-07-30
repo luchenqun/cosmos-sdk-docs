@@ -1,5 +1,182 @@
 # ADR 031: Protobuf Msg Services
 
+## 变更日志
+
+* 2020-10-05: 初始草稿
+* 2021-04-21: 移除 `ServiceMsg` 以遵循 Protobuf `Any` 的规范，参见 [#9063](https://github.com/cosmos/cosmos-sdk/issues/9063)。
+
+## 状态
+
+已接受
+
+## 摘要
+
+我们希望利用 protobuf 的 `service` 定义来定义 `Msg`，这将在生成的代码和返回类型明确定义方面为开发人员提供显著的开发体验改进。
+
+## 背景
+
+目前，Cosmos SDK 中的 `Msg` 处理程序在响应的 `data` 字段中具有返回值。然而，除了在 golang 处理程序代码中之外，这些返回值没有在任何地方指定。
+
+在早期的讨论中，[有人提议](https://docs.google.com/document/d/1eEgYgvgZqLE45vETjhwIw4VOqK-5hwQtZtjVbiXnIGc/edit)使用 protobuf 扩展字段来捕获 `Msg` 的返回类型，例如：
+
+```protobuf
+package cosmos.gov;
+
+message MsgSubmitProposal
+	option (cosmos_proto.msg_return) = “uint64”;
+	string delegator_address = 1;
+	string validator_address = 2;
+	repeated sdk.Coin amount = 3;
+}
+```
+
+然而，这个提议从未被采纳。
+
+为 `Msg` 定义一个明确定义的返回值将改善客户端的开发体验。例如，在 `x/gov` 模块中，`MsgSubmitProposal` 以大端序的 `uint64` 形式返回提案 ID。这并没有在任何地方进行详细说明，客户端需要了解 Cosmos SDK 的内部机制来解析该值并将其返回给用户。
+
+此外，可能存在一些情况，我们希望以编程方式使用这些返回值。例如，https://github.com/cosmos/cosmos-sdk/issues/7093 提出了一种使用 `Msg` 路由器进行模块间 Ocaps 的方法。明确定义的返回类型将改善此方法的开发人员体验。
+
+此外，`Msg` 类型的处理程序注册往往会在 keeper 之上添加一些样板代码，并且通常是通过手动类型切换来完成的。这并不一定是不好的，但它确实增加了创建模块的开销。
+
+## 决策
+
+我们决定使用 protobuf 的 `service` 定义来定义 `Msg`，以及由它们生成的代码，作为 `Msg` 处理程序的替代品。
+
+下面我们定义了 `x/gov` 模块中 `SubmitProposal` 消息的实现方式：
+
+```protobuf
+package cosmos.gov;
+
+service Msg {
+  rpc SubmitProposal(MsgSubmitProposal) returns (MsgSubmitProposalResponse);
+}
+
+// Note that for backwards compatibility this uses MsgSubmitProposal as the request
+// type instead of the more canonical MsgSubmitProposalRequest
+message MsgSubmitProposal {
+  google.protobuf.Any content = 1;
+  string proposer = 2;
+}
+
+message MsgSubmitProposalResponse {
+  uint64 proposal_id;
+}
+```
+
+虽然这种方式最常用于gRPC，但像这样重载protobuf `service`定义并不违反[protobuf规范](https://developers.google.com/protocol-buffers/docs/proto3#services)的意图，该规范指出：
+> 如果您不想使用gRPC，也可以使用自己的RPC实现来使用协议缓冲区。
+通过这种方法，我们将获得一个自动生成的`MsgServer`接口：
+
+除了明确指定返回类型外，这还有一个好处，即生成客户端和服务器端代码。在服务器端，这几乎就像是一个自动生成的keeper方法，可能最终可以替代keepers（参见[\#7093](https://github.com/cosmos/cosmos-sdk/issues/7093)）：
+
+```go
+package gov
+
+type MsgServer interface {
+  SubmitProposal(context.Context, *MsgSubmitProposal) (*MsgSubmitProposalResponse, error)
+}
+```
+
+在客户端，开发人员可以通过创建封装事务逻辑的RPC实现来利用这一点。像[protobuf.js](https://github.com/protobufjs/protobuf.js#using-services)这样使用异步回调的Protobuf库可以使用这个功能为特定消息注册回调，即使是包含多个`Msg`的事务也可以。
+
+每个`Msg`服务方法应该有且只有一个请求参数：对应的`Msg`类型。例如，上面的`Msg`服务方法`/cosmos.gov.v1beta1.Msg/SubmitProposal`只有一个请求参数，即`Msg`类型`/cosmos.gov.v1beta1.MsgSubmitProposal`。重要的是，读者清楚地理解`Msg`服务（Protobuf服务）和`Msg`类型（Protobuf消息）之间的命名差异以及其完全限定名称的差异。
+
+这种约定是基于更经典的`Msg...Request`名称的决定，主要是为了向后兼容性，但也为了在`TxBody.messages`（参见下面的[编码部分](#encoding)）中更好地可读性：包含`/cosmos.gov.MsgSubmitProposal`的事务比包含`/cosmos.gov.v1beta1.MsgSubmitProposalRequest`的事务更易读。
+
+这种约定的一个结果是，每个`Msg`类型只能是一个`Msg`服务方法的请求参数。然而，我们认为这种限制是一种明确性的良好实践。
+
+### 编码
+
+使用`Msg`服务生成的交易的编码与当前在[ADR-020](adr-020-protobuf-transaction-encoding.md)中定义的Protobuf交易编码没有区别。我们将`Msg`类型（即`Msg`服务方法的请求参数）编码为`Tx`中的`Any`，这涉及将二进制编码的`Msg`与其类型URL一起打包。
+
+### 解码
+
+由于`Msg`类型被打包到`Any`中，解码交易消息是通过将`Any`解包为`Msg`类型来完成的。有关更多信息，请参阅[ADR-020](adr-020-protobuf-transaction-encoding.md#transactions)。
+
+### 路由
+
+我们建议在BaseApp中添加一个`msg_service_router`。这个路由器是一个键值映射，将`Msg`类型的`type_url`映射到其对应的`Msg`服务方法处理程序。由于`Msg`类型和`Msg`服务方法之间存在一对一的映射关系，`msg_service_router`每个`Msg`服务方法恰好有一个条目。
+
+当BaseApp处理交易（在CheckTx或DeliverTx中）时，它的`TxBody.messages`被解码为`Msg`。每个`Msg`的`type_url`与`msg_service_router`中的条目进行匹配，并调用相应的`Msg`服务方法处理程序。
+
+为了向后兼容，旧的处理程序尚未删除。如果BaseApp接收到一个在`msg_service_router`中没有对应条目的旧的`Msg`，它将通过其旧的`Route()`方法路由到旧的处理程序。
+
+### 模块配置
+
+在[ADR 021](adr-021-protobuf-query-encoding.md)中，我们引入了一个名为`RegisterQueryService`的方法，允许模块注册gRPC查询器。
+
+为了注册`Msg`服务，我们尝试采用更具扩展性的方法，将`RegisterQueryService`转换为更通用的`RegisterServices`方法：
+
+```go
+type AppModule interface {
+  RegisterServices(Configurator)
+  ...
+}
+
+type Configurator interface {
+  QueryServer() grpc.Server
+  MsgServer() grpc.Server
+}
+
+// example module:
+func (am AppModule) RegisterServices(cfg Configurator) {
+	types.RegisterQueryServer(cfg.QueryServer(), keeper)
+	types.RegisterMsgServer(cfg.MsgServer(), keeper)
+}
+```
+
+`RegisterServices`方法和`Configurator`接口旨在满足[\#7093](https://github.com/cosmos/cosmos-sdk/issues/7093)和[\#7122](https://github.com/cosmos/cosmos-sdk/issues/7421)中讨论的用例需求，并将不断发展。
+
+当注册`Msg`服务时，框架应该验证所有`Msg`类型是否实现了`sdk.Msg`接口，并在初始化过程中抛出错误，而不是在处理交易时才抛出错误。
+
+### `Msg`服务实现
+
+与查询服务一样，`Msg`服务方法可以使用`sdk.UnwrapSDKContext`方法从`context.Context`参数方法中获取`sdk.Context`：
+
+```go
+package gov
+
+func (k Keeper) SubmitProposal(goCtx context.Context, params *types.MsgSubmitProposal) (*MsgSubmitProposalResponse, error) {
+	ctx := sdk.UnwrapSDKContext(goCtx)
+    ...
+}
+```
+
+`sdk.Context`应该已经通过BaseApp的`msg_service_router`附加了`EventManager`。
+
+使用这种方法不再需要单独的处理程序定义。
+
+## 结果
+
+这种设计改变了模块功能的暴露和访问方式。它废弃了现有的`Handler`接口和`AppModule.Route`，而采用了[Protocol Buffer Services](https://developers.google.com/protocol-buffers/docs/proto3#services)和上述的服务路由。这极大地简化了代码。我们不再需要创建处理程序和保管人。使用协议缓冲区自动生成的客户端清楚地分离了模块和模块用户之间的通信接口。控制逻辑（即处理程序和保管人）不再暴露。模块接口可以被视为通过客户端API访问的黑盒。值得注意的是，客户端接口也是由协议缓冲区生成的。
+
+这还允许我们改变如何执行功能测试。我们将不再模拟AppModules和Router，而是模拟一个客户端（服务器将保持隐藏）。具体来说：我们将不再在`moduleB`中模拟`moduleA.MsgServer`，而是模拟`moduleA.MsgClient`。可以将其视为与外部服务（例如数据库或在线服务器）一起工作。我们假设由生成的协议缓冲区正确处理客户端和服务器之间的传输。
+
+最后，将模块对客户端API进行封闭，打开了ADR-033中讨论的期望的OCAP模式。由于服务器实现和接口被隐藏，没有人可以持有"保管人"/服务器，并且将被迫依赖于客户端接口，这将引导开发人员进行正确的封装和软件工程模式。
+
+### 优点
+
+* 清晰地传达返回类型
+* 不再需要手动处理程序注册和返回类型编组，只需实现接口并注册即可
+* 通信接口会自动生成，开发人员现在只需专注于状态转换方法 - 如果我们选择采用 [\#7093](https://github.com/cosmos/cosmos-sdk/issues/7093) 方法，这将改善用户体验
+* 生成的客户端代码对客户端和测试非常有用
+* 大大减少和简化了代码
+
+### 缺点
+
+* 在 gRPC 上下文之外使用 `service` 定义可能会令人困惑（但不违反 proto3 规范）
+
+## 参考资料
+
+* [初始 Github 问题 \#7122](https://github.com/cosmos/cosmos-sdk/issues/7122)
+* [proto 3 语言指南：定义服务](https://developers.google.com/protocol-buffers/docs/proto3#services)
+* [初始的 pre-`Any` `Msg` 设计](https://docs.google.com/document/d/1eEgYgvgZqLE45vETjhwIw4VOqK-5hwQtZtjVbiXnIGc)
+* [ADR 020](adr-020-protobuf-transaction-encoding.md)
+* [ADR 021](adr-021-protobuf-query-encoding.md)
+
+
+# ADR 031: Protobuf Msg Services
+
 ## Changelog
 
 * 2020-10-05: Initial Draft

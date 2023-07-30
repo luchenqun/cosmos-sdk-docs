@@ -1,3 +1,63 @@
+# ADR 创建流程
+
+1. 复制 `adr-template.md` 文件。使用以下文件名模式：`adr-next_number-title.md`
+2. 如果您想要获得早期反馈，请创建一个草稿 Pull Request。
+3. 确保上下文和解决方案清晰并且有良好的文档记录。
+4. 在 [README](README.md) 文件中的列表中添加一个条目。
+5. 创建一个 Pull Request 来提议一个新的 ADR。
+
+## 什么是 ADR？
+
+ADR 是一个用于记录实现和设计的文档，这些实现和设计可能已经在 RFC 中讨论过，也可能没有。虽然 RFC 旨在取代分布式环境中的同步通信，但 ADR 旨在记录已经做出的决策。ADR 不会带来太多的沟通开销，因为讨论已经在 RFC 或同步讨论中记录下来。如果共识来自同步讨论，则应在 ADR 中添加一个简短的摘录来解释目标。
+
+## ADR 生命周期
+
+ADR 创建是一个**迭代**的过程。ADR 用于在已经做出决策并且需要添加实现细节时，以减少沟通开销。ADR 应该记录特定问题的集体共识以及如何解决它。
+
+1. 每个 ADR 应该始于 RFC 或讨论，其中已经达成共识。
+
+2. 一旦达成共识，就会创建一个 GitHub Pull Request（PR），其中包含基于 `adr-template.md` 的新文档。
+
+3. 如果合并了一个 _proposed_ ADR，则应在 ADR 文档注释或 GitHub Issue 中清楚地记录未解决的问题。
+
+4. PR 应该始终被合并。在出现错误的 ADR 的情况下，我们仍然更喜欢将其与 _rejected_ 状态合并。唯一不合并 ADR 的情况是作者放弃了它。
+
+5. 合并的 ADR 不应被修剪。
+
+### ADR 状态
+
+状态由两个组成部分组成：
+
+```text
+{共识状态} {实现状态}
+```
+
+实现状态可以是 `Implemented` 或 `Not Implemented`。
+
+#### 共识状态
+
+```text
+DRAFT -> PROPOSED -> LAST CALL yyyy-mm-dd -> ACCEPTED | REJECTED -> SUPERSEDED by ADR-xxx
+                  \        |
+                   \       |
+                    v      v
+                     ABANDONED
+```
+
+* `DRAFT`：[可选]正在进行中的 ADR，尚未准备好进行全面审查。这是为了展示早期工作并在草稿 Pull Request 形式中获得早期反馈。
+* `PROPOSED`：涵盖完整解决方案架构并仍在审查中的 ADR - 项目利益相关者尚未达成一致意见。
+* `LAST CALL <最后通知日期>`：[可选]明确通知我们即将接受更新。将状态更改为 `LAST CALL` 意味着已经达成了社会共识（Cosmos SDK 维护者的共识），我们仍然希望给予时间让社区做出反应或分析。
+* `ACCEPTED`：代表当前已实施或将要实施的架构设计的 ADR。
+* `REJECTED`：如果项目利益相关者之间的共识决定如此，ADR 可从 PROPOSED 或 ACCEPTED 转为 rejected。
+* `SUPERSEEDED by ADR-xxx`：已被新 ADR 取代的 ADR。
+* `ABANDONED`：原始作者不再追求该 ADR。
+
+## ADR中使用的语言
+
+* 上下文/背景应以现在时态写成。
+* 避免使用第一人称形式。
+
+
 # ADR Creation Process
 
 1. Copy the `adr-template.md` file. Use the following filename pattern: `adr-next_number-title.md`

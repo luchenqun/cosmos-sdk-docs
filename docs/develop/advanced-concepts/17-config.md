@@ -1,3 +1,25 @@
+# 配置
+
+本文档涉及 app.toml，如果您想阅读有关 config.toml 的内容，请访问[CometBFT文档](https://docs.cometbft.com/v0.37/)。
+
+<!-- 以下内容不是 Python 参考，但语法着色使文件在文档中更易读 -->
+```python reference
+https://github.com/cosmos/cosmos-sdk/blob/main/tools/confix/data/v0.47-app.toml 
+```
+
+## inter-block-cache
+
+启用此功能将消耗比普通节点更多的内存。
+
+## iavl-cache-size
+
+使用此功能将增加内存消耗。
+
+## iavl-lazy-loading
+
+此功能用于存档节点，使其能够更快地启动。
+
+
 
 
 # Configuration
