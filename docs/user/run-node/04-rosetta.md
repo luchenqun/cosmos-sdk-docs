@@ -1,3 +1,123 @@
+# Rosetta
+
+`rosetta` 包实现了 Coinbase 的 [Rosetta API](https://www.rosetta-api.org)。本文档提供了如何使用 Rosetta API 集成的说明。有关动机和设计选择的信息，请参阅 [ADR 035](https://docs.cosmos.network/main/architecture/adr-035-rosetta-api-support)。
+
+## 添加 Rosetta 命令
+
+Rosetta API 服务器是一个独立的服务器，连接到使用 Cosmos SDK 开发的链的节点。
+
+要启用 Rosetta API 支持，需要将 `RosettaCommand` 添加到应用程序的根命令文件中（例如 `simd/cmd/root.go`）。
+
+导入 `rosettaCmd` 包：
+
+```go
+import "cosmossdk.io/tools/rosetta/cmd"
+```
+
+找到以下行：
+
+```go
+initRootCmd(rootCmd, encodingConfig)
+```
+
+在该行之后，添加以下内容：
+
+```go
+rootCmd.AddCommand(
+  rosettaCmd.RosettaCommand(encodingConfig.InterfaceRegistry, encodingConfig.Codec)
+)
+```
+
+`RosettaCommand` 函数构建了 `rosetta` 根命令，并在 `rosettaCmd` 包（`cosmossdk.io/tools/rosetta/cmd`）中定义。
+
+由于我们已经更新了 Cosmos SDK 以与 Rosetta API 兼容，只需更新应用程序的根命令文件即可。
+
+在 `simapp` 包中可以找到一个实现示例。
+
+## 使用 Rosetta 命令
+
+要在应用程序的 CLI 中运行 Rosetta，请使用以下命令：
+
+```shell
+simd rosetta --help
+```
+
+要测试和运行正在运行和公开的应用程序的 Rosetta API 端点，请使用以下命令：
+
+```shell
+simd rosetta
+     --blockchain "your application name (ex: gaia)"
+     --network "your chain identifier (ex: testnet-1)"
+     --tendermint "tendermint endpoint (ex: localhost:26657)"
+     --grpc "gRPC endpoint (ex: localhost:9090)"
+     --addr "rosetta binding address (ex: :8080)"
+```
+
+## 使用独立的 Rosetta
+
+要在应用程序中不添加 Rosetta 的情况下使用独立的 Rosetta，请使用以下命令进行安装：
+
+```bash
+go install cosmossdk.io/tools/rosetta/cmd/rosetta
+```
+
+或者，如果要从源代码构建，请直接运行 `make rosetta`。二进制文件将位于 `tools/rosetta` 目录中。
+
+## 扩展
+
+有两种方式可以使用自定义设置来自定义和扩展实现。
+
+### 消息扩展
+
+为了使 `sdk.Msg` 能够被 Rosetta 理解，唯一需要的是为您的消息添加满足 `rosetta.Msg` 接口的方法。如何实现这些方法的示例可以在委托类型（例如 `MsgDelegate`）或银行类型（例如 `MsgSend`）中找到。
+
+### 客户端接口覆盖
+
+如果需要更多的自定义，可以嵌入Client类型并覆盖需要自定义的方法。
+
+示例：
+
+```go
+package custom_client
+import (
+
+"context"
+"github.com/coinbase/rosetta-sdk-go/types"
+"cosmossdk.io/tools/rosetta/lib"
+)
+
+// CustomClient embeds the standard cosmos client
+// which means that it implements the cosmos-rosetta-gateway Client
+// interface while at the same time allowing to customize certain methods
+type CustomClient struct {
+    *rosetta.Client
+}
+
+func (c *CustomClient) ConstructionPayload(_ context.Context, request *types.ConstructionPayloadsRequest) (resp *types.ConstructionPayloadsResponse, err error) {
+    // provide custom signature bytes
+    panic("implement me")
+}
+```
+
+注意：当使用自定义客户端时，由于所需的构造函数可能不同，无法使用该命令，因此需要创建一个新的客户端。我们计划在未来提供一种在不编写额外代码的情况下初始化自定义客户端的方法。
+
+### 错误扩展
+
+由于Rosetta要求将“返回”的错误提供给网络选项。为了声明一个新的Rosetta错误，我们在cosmos-rosetta-gateway中使用`errors`包。
+
+示例：
+
+```go
+package custom_errors
+import crgerrs "cosmossdk.io/tools/rosetta/lib/errors"
+
+var customErrRetriable = true
+var CustomError = crgerrs.RegisterError(100, "custom message", customErrRetriable, "description")
+```
+
+注意：必须在调用cosmos-rosetta-gateway的`Server`.`Start`方法之前注册错误。否则，注册将被忽略。相同代码的错误也将被忽略。
+
+
 
 
 # Rosetta

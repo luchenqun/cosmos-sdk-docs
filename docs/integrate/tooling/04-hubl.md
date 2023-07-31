@@ -1,3 +1,74 @@
+# Hubl
+
+`Hubl`是一个工具，允许您查询任何基于Cosmos SDK的区块链。
+它利用了Cosmos SDK的新[AutoCLI](https://pkg.go.dev/github.com/cosmos/cosmos-sdk/client/v2@v2.0.0-20220916140313-c5245716b516/cli)功能<!-- TODO replace with AutoCLI docs -->。
+
+## 安装
+
+可以使用`go install`安装Hubl：
+
+```shell
+go install cosmossdk.io/tools/hubl/cmd/hubl@latest
+```
+
+或者从源代码构建：
+
+```shell
+git clone --depth=1 https://github.com/cosmos/cosmos-sdk
+make hubl
+```
+
+二进制文件将位于`tools/hubl`目录下。
+
+## 使用
+
+```shell
+hubl --help
+```
+
+### 添加链
+
+要配置新的链，请使用`--init`标志和链的名称（在链注册表<https://github.com/cosmos/chain-registry>中列出）运行此命令。
+
+如果链未在链注册表中列出，可以使用任何唯一的名称。
+
+```shell
+hubl init [chain-name]
+hubl init regen
+```
+
+链配置存储在`~/.hubl/config.toml`中。
+
+:::tip
+
+当使用不安全的gRPC端点时，在配置文件中将`insecure`字段更改为`true`。
+
+```toml
+[chains]
+[chains.regen]
+[[chains.regen.trusted-grpc-endpoints]]
+endpoint = 'localhost:9090'
+insecure = true
+```
+
+或者使用`--insecure`标志：
+
+```shell
+hubl init regen --insecure
+```
+
+:::
+
+### 查询
+
+要查询链，可以使用`query`命令。
+然后指定要查询的模块和查询本身。
+
+```shell
+hubl regen query auth module-accounts
+```
+
+
 
 
 # Hubl

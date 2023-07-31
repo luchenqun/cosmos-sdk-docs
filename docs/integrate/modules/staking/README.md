@@ -1,3 +1,2643 @@
+# `x/staking`
+
+## 摘要
+
+本文规定了Cosmos SDK的Staking模块，该模块首次在2016年6月的[Cosmos白皮书](https://cosmos.network/about/whitepaper)中进行了描述。
+
+该模块使得基于Cosmos SDK的区块链能够支持先进的权益证明（PoS）系统。在该系统中，链上原生权益代币的持有者可以成为验证人，并可以委托代币给验证人，最终决定系统的有效验证人集合。
+
+该模块在Cosmos网络中的第一个Hub——Cosmos Hub中使用。
+
+## 目录
+
+* [状态](#state)
+    * [Pool](#pool)
+    * [LastTotalPower](#lasttotalpower)
+    * [ValidatorUpdates](#validatorupdates)
+    * [UnbondingID](#unbondingid)
+    * [Params](#params)
+    * [Validator](#validator)
+    * [Delegation](#delegation)
+    * [UnbondingDelegation](#unbondingdelegation)
+    * [Redelegation](#redelegation)
+    * [Queues](#queues)
+    * [HistoricalInfo](#historicalinfo)
+* [状态转换](#state-transitions)
+    * [验证人](#validators)
+    * [委托](#delegations)
+    * [惩罚](#slashing)
+    * [份额计算方式](#how-shares-are-calculated)
+* [消息](#messages)
+    * [MsgCreateValidator](#msgcreatevalidator)
+    * [MsgEditValidator](#msgeditvalidator)
+    * [MsgDelegate](#msgdelegate)
+    * [MsgUndelegate](#msgundelegate)
+    * [MsgCancelUnbondingDelegation](#msgcancelunbondingdelegation)
+    * [MsgBeginRedelegate](#msgbeginredelegate)
+    * [MsgUpdateParams](#msgupdateparams)
+* [Begin-Block](#begin-block)
+    * [历史信息追踪](#historical-info-tracking)
+* [End-Block](#end-block)
+    * [验证人集合变更](#validator-set-changes)
+    * [Queues](#queues-1)
+* [Hooks](#hooks)
+* [Events](#events)
+    * [EndBlocker](#endblocker)
+    * [消息](#msgs)
+* [参数](#parameters)
+* [客户端](#client)
+    * [CLI](#cli)
+    * [gRPC](#grpc)
+    * [REST](#rest)
+
+## 状态
+
+### Pool
+
+Pool用于跟踪债券面额的已绑定和未绑定的代币供应量。
+
+### LastTotalPower
+
+LastTotalPower跟踪上一个结束块期间记录的已绑定代币的总量。以"Last"为前缀的存储条目在EndBlock之前必须保持不变。
+
+* LastTotalPower: `0x12 -> ProtocolBuffer(math.Int)`
+
+### ValidatorUpdates
+
+ValidatorUpdates 包含了每个区块结束时返回给 ABCI 的验证者更新。这些值在每个区块中被覆盖。
+
+* ValidatorUpdates `0x61 -> []abci.ValidatorUpdate`
+
+### UnbondingID
+
+UnbondingID 存储了最新解绑操作的 ID。它可以为解绑操作创建唯一的 ID，即每次启动新的解绑操作（验证者解绑、解绑委托、重新委托）时，UnbondingID 会递增。
+
+* UnbondingID: `0x37 -> uint64`
+
+### Params
+
+staking 模块将其参数存储在状态中，前缀为 `0x51`，可以通过治理或具有权限的地址进行更新。
+
+* Params: `0x51 | ProtocolBuffer(Params)`
+
+```protobuf reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/proto/cosmos/staking/v1beta1/staking.proto#L310-L333
+```
+
+### Validator
+
+验证者可以有三种状态之一
+
+* `Unbonded`: 验证者不在活跃集合中。他们不能签名区块，也不能获得奖励。他们可以接收委托。
+* `Bonded`: 一旦验证者获得足够的质押代币，它们会在 [`EndBlock`](#validator-set-changes) 期间自动加入活跃集合，并且其状态更新为 `Bonded`。他们会签名区块并获得奖励。他们可以接收更多的委托。如果这个验证者的委托人解除委托，他们必须等待特定链上的 UnbondingTime 时长，在此期间，如果这些委托人在质押代币的期间内犯有违规行为，他们仍然可以被处罚。 
+* `Unbonding`: 当验证者由于选择、惩罚、拘留或删除而离开活跃集合时，所有委托将开始解绑。所有委托必须等待 UnbondingTime，然后将其代币从 `BondedPool` 转移到其账户中。
+
+:::warning
+删除是永久性的，一旦删除，验证者的共识密钥将无法在发生删除的链上重新使用。
+:::
+
+Validators对象应该主要通过`OperatorAddr`进行存储和访问，`OperatorAddr`是验证者的SDK验证者地址。每个验证者对象还维护两个额外的索引，以满足对惩罚和验证者集更新的必要查找。还维护了第三个特殊索引(`LastValidatorPower`)，但是它在每个块中保持不变，不像前两个索引，它们会在块内镜像验证者记录。
+
+* Validators: `0x21 | OperatorAddrLen (1 byte) | OperatorAddr -> ProtocolBuffer(validator)`
+* ValidatorsByConsAddr: `0x22 | ConsAddrLen (1 byte) | ConsAddr -> OperatorAddr`
+* ValidatorsByPower: `0x23 | BigEndian(ConsensusPower) | OperatorAddrLen (1 byte) | OperatorAddr -> OperatorAddr`
+* LastValidatorsPower: `0x11 | OperatorAddrLen (1 byte) | OperatorAddr -> ProtocolBuffer(ConsensusPower)`
+* ValidatorsByUnbondingID: `0x38 | UnbondingID ->  0x21 | OperatorAddrLen (1 byte) | OperatorAddr`
+
+`Validators`是主要索引 - 它确保每个操作员只能有一个关联的验证者，该验证者的公钥可以在将来更改。委托人可以引用验证者的不可变操作员，而不必担心公钥的变化。
+
+`ValidatorsByUnbondingID`是一个额外的索引，它可以通过当前解绑ID查找验证者。
+
+`ValidatorByConsAddr`是一个额外的索引，它可以通过验证者的ConsPubKey派生的地址查找验证者。当CometBFT报告证据时，它提供了验证者地址，因此需要此映射来查找操作员。请注意，`ConsAddr`对应于可以从验证者的`ConsPubKey`派生的地址。
+
+`ValidatorsByPower`是一个额外的索引，它提供了一个排序的潜在验证者列表，以快速确定当前的活动集。在这里，ConsensusPower默认为validator.Tokens/10^6。请注意，所有`Jailed`为true的验证者都不存储在此索引中。
+
+`LastValidatorsPower`是一个特殊索引，它提供了上一个块中绑定的验证者的历史列表。此索引在块中保持不变，但在验证者集更新过程中会在[`EndBlock`](#end-block)中更新。
+
+每个验证人的状态都存储在一个名为`Validator`的结构体中：
+
+```protobuf reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/proto/cosmos/staking/v1beta1/staking.proto#L82-L138
+```
+
+```protobuf reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/proto/cosmos/staking/v1beta1/staking.proto#L26-L80
+```
+
+### 委托
+
+委托通过将`DelegatorAddr`（委托人的地址）与`ValidatorAddr`（验证人的地址）组合来进行标识。委托人在存储中的索引如下：
+
+* 委托：`0x31 | DelegatorAddrLen（1字节）| DelegatorAddr | ValidatorAddrLen（1字节）| ValidatorAddr -> ProtocolBuffer（委托）`
+
+持币人可以将代币委托给验证人；在这种情况下，他们的资金将保存在一个名为`Delegation`的数据结构中。它由一个委托人拥有，并与一个验证人的份额相关联。交易的发送者是债券的所有者。
+
+```protobuf reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/proto/cosmos/staking/v1beta1/staking.proto#L198-L216
+```
+
+#### 委托人份额
+
+当某人将代币委托给验证人时，根据委托给验证人的代币总数和迄今为止发行的份额数量，他们将获得一定数量的委托人份额，计算方法如下：
+
+`每个代币的份额 = 验证人的总份额 / 验证人的代币数量`
+
+只有收到的份额数量存储在`DelegationEntry`中。当委托人解除委托时，他们收到的代币数量是根据他们当前持有的份额数量和反向兑换率计算的：
+
+`每个份额的代币 = 验证人的代币数量 / 验证人的份额数量`
+
+这些`份额`只是一种会计机制，它们不是可替代的资产。采用这种机制的原因是为了简化关于惩罚的会计工作。与其逐个惩罚每个委托条目的代币，不如直接对验证人的总委托代币进行惩罚，从而有效地降低每个已发行委托人份额的价值。
+
+### 解委托
+
+`Delegation`中的份额可以被解除委托，但它们必须在一段时间内作为`UnbondingDelegation`存在，如果检测到拜占庭行为，份额可以被减少。
+
+`UnbondingDelegation`在存储中的索引如下：
+
+- UnbondingDelegation：`0x32 | DelegatorAddrLen（1字节）| DelegatorAddr | ValidatorAddrLen（1字节）| ValidatorAddr -> ProtocolBuffer（unbondingDelegation）`
+- UnbondingDelegationsFromValidator：`0x33 | ValidatorAddrLen（1字节）| ValidatorAddr | DelegatorAddrLen（1字节）| DelegatorAddr -> nil`
+- UnbondingDelegationByUnbondingId：`0x38 | UnbondingId -> 0x32 | DelegatorAddrLen（1字节）| DelegatorAddr | ValidatorAddrLen（1字节）| ValidatorAddr`
+`UnbondingDelegation`用于查询，以查找给定委托人的所有解绑委托。
+
+`UnbondingDelegationsFromValidator`用于惩罚，以查找与给定验证人相关的所有解绑委托，这些解绑委托需要被惩罚。
+
+`UnbondingDelegationByUnbondingId`是一个额外的索引，可以通过包含的解绑委托条目的解绑ID来进行查找解绑委托。
+
+每次发起解绑时，都会创建一个`UnbondingDelegation`对象。
+
+```protobuf reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/proto/cosmos/staking/v1beta1/staking.proto#L218-L261
+```
+
+### 重新委托
+
+`Delegation`的绑定代币可以立即从源验证人重新委托给不同的验证人（目标验证人）。但是，当发生这种情况时，它们必须在`Redelegation`对象中进行跟踪，以便如果它们的代币导致源验证人发生拜占庭错误，可以对其份额进行惩罚。
+
+`Redelegation`在存储中的索引如下：
+
+- Redelegations：`0x34 | DelegatorAddrLen（1字节）| DelegatorAddr | ValidatorAddrLen（1字节）| ValidatorSrcAddr | ValidatorDstAddr -> ProtocolBuffer（redelegation）`
+- RedelegationsBySrc：`0x35 | ValidatorSrcAddrLen（1字节）| ValidatorSrcAddr | ValidatorDstAddrLen（1字节）| ValidatorDstAddr | DelegatorAddrLen（1字节）| DelegatorAddr -> nil`
+- RedelegationsByDst：`0x36 | ValidatorDstAddrLen（1字节）| ValidatorDstAddr | ValidatorSrcAddrLen（1字节）| ValidatorSrcAddr | DelegatorAddrLen（1字节）| DelegatorAddr -> nil`
+- RedelegationByUnbondingId：`0x38 | UnbondingId -> 0x34 | DelegatorAddrLen（1字节）| DelegatorAddr | ValidatorAddrLen（1字节）| ValidatorSrcAddr | ValidatorDstAddr`
+
+`Redelegations` 用于查询，以查找给定委托人的所有重新委托。
+
+`RedelegationsBySrc` 用于基于 `ValidatorSrcAddr` 进行惩罚。
+
+`RedelegationsByDst` 用于基于 `ValidatorDstAddr` 进行惩罚。
+
+这里的第一个映射用于查询，以查找给定委托人的所有重新委托。第二个映射用于基于 `ValidatorSrcAddr` 进行惩罚，而第三个映射用于基于 `ValidatorDstAddr` 进行惩罚。
+
+`RedelegationByUnbondingId` 是一个额外的索引，可以通过包含的解委托条目的解委托 ID 进行查找。
+
+每次发生重新委托时，都会创建一个重新委托对象。为了防止“重新委托跳跃”，在以下情况下不允许进行重新委托：
+
+* （重新）委托人已经有另一个未成熟的重新委托正在进行中，其目标是一个验证人（我们称之为“验证人 X”）
+* 并且，（重新）委托人正试图创建一个“新”的重新委托，其中此新重新委托的源验证人是“验证人 X”。
+
+```protobuf reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/proto/cosmos/staking/v1beta1/staking.proto#L263-L308
+```
+
+### 队列
+
+所有队列对象都按时间戳排序。在任何队列中使用的时间首先四舍五入到最近的纳秒，然后排序。可排序的时间格式是 RFC3339Nano 的轻微修改版本，使用格式字符串 `"2006-01-02T15:04:05.000000000"`。值得注意的是，此格式：
+
+* 右侧填充所有零
+* 删除时区信息（使用 UTC）
+
+在所有情况下，存储的时间戳表示队列元素的成熟时间。
+
+#### 解委托队列
+
+为了跟踪解委托的进展，保留了解委托队列。
+
+* 解委托：`0x41 | format(time) -> []DVPair`
+
+```protobuf reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/proto/cosmos/staking/v1beta1/staking.proto#L162-L172
+```
+
+#### 重新委托队列
+
+为了跟踪重新委托的进展，保留了重新委托队列。
+
+* RedelegationQueue: `0x42 | format(time) -> []DVVTriplet`
+
+```protobuf reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/proto/cosmos/staking/v1beta1/staking.proto#L179-L191
+```
+
+#### ValidatorQueue
+
+为了跟踪解绑验证人的进展，保留了验证人队列。
+
+* ValidatorQueueTime: `0x43 | format(time) -> []sdk.ValAddress`
+
+存储的对象是每个键都是验证人操作者地址的数组，通过该数组可以访问验证人对象。通常情况下，预期在给定的时间戳上只与一个验证人记录关联，但是在同一位置可能存在多个验证人。
+
+### HistoricalInfo
+
+HistoricalInfo 对象在每个块上存储和修剪，以便 staking keeper 持久化由 staking 模块参数 `HistoricalEntries` 定义的最新的 `n` 个历史信息。
+
+```go reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/proto/cosmos/staking/v1beta1/staking.proto#L17-L24
+```
+
+在每个 BeginBlock 时，staking keeper 将当前 Header 和提交当前块的验证人存储在一个 `HistoricalInfo` 对象中。验证人按照其地址排序，以确保它们处于确定性顺序。最旧的 HistoricalEntries 将被修剪，以确保只存在参数定义的历史条目数。
+
+## 状态转换
+
+### 验证人
+
+验证人的状态转换在每个 [`EndBlock`](#validator-set-changes) 中执行，以检查活跃的 `ValidatorSet` 是否发生变化。
+
+验证人可以是 `Unbonded`、`Unbonding` 或 `Bonded`。`Unbonded` 和 `Unbonding` 统称为 `Not Bonded`。验证人可以直接在所有状态之间转换，除了从 `Bonded` 转换到 `Unbonded`。
+
+#### 从 Not bonded 转换到 Bonded
+
+当验证人在 `ValidatorPowerIndex` 中的排名超过 `LastValidator` 时，发生以下转换：
+
+* 将 `validator.Status` 设置为 `Bonded`
+* 将 `validator.Tokens` 从 `NotBondedTokens` 发送到 `BondedPool` 的 `ModuleAccount`
+* 从 `ValidatorByPowerIndex` 中删除现有记录
+* 向 `ValidatorByPowerIndex` 添加新的更新记录
+* 更新此验证人的 `Validator` 对象
+* 如果存在，删除此验证人的任何 `ValidatorQueue` 记录
+
+#### 从质押到解质押
+
+当验证人开始解质押过程时，会执行以下操作：
+
+* 将 `validator.Tokens` 从 `BondedPool` 发送到 `NotBondedTokens` `ModuleAccount`
+* 将 `validator.Status` 设置为 `Unbonding`
+* 从 `ValidatorByPowerIndex` 中删除现有记录
+* 向 `ValidatorByPowerIndex` 添加新的更新记录
+* 更新此验证人的 `Validator` 对象
+* 为此验证人在 `ValidatorQueue` 中插入新的记录
+
+#### 从解质押到未质押
+
+当 `ValidatorQueue` 对象从质押变为未质押时，验证人从解质押状态变为未质押状态
+
+* 更新此验证人的 `Validator` 对象
+* 将 `validator.Status` 设置为 `Unbonded`
+
+#### 禁闭/解禁
+
+当验证人被禁闭时，实际上是从 CometBFT 集合中移除了该验证人。
+此过程也可以被逆转。执行以下操作：
+
+* 设置 `Validator.Jailed` 并更新对象
+* 如果被禁闭，则从 `ValidatorByPowerIndex` 中删除记录
+* 如果被解禁，则向 `ValidatorByPowerIndex` 添加记录
+
+被禁闭的验证人不会出现在以下任何存储中：
+
+* 力量存储（从共识力量到地址）
+
+### 委托
+
+#### 委托
+
+当发生委托时，验证人和委托对象都会受到影响
+
+* 根据委托的代币和验证人的兑换率确定委托人的份额
+* 从发送账户中移除代币
+* 将份额添加到委托对象或将其添加到创建的验证人对象中
+* 添加新的委托人份额并更新 `Validator` 对象
+* 将 `delegation.Amount` 从委托人的账户转移到 `BondedPool` 或 `NotBondedPool` `ModuleAccount`，具体取决于 `validator.Status` 是否为 `Bonded`
+* 从 `ValidatorByPowerIndex` 中删除现有记录
+* 向 `ValidatorByPowerIndex` 添加新的更新记录
+
+#### 开始解质押
+
+作为取消委托和完成解质押状态转换的一部分，可能会调用解质押委托。
+
+* 从委托人中减去未质押的份额
+* 将未质押的代币添加到 `UnbondingDelegationEntry`
+* 更新委托或如果没有更多份额则删除委托
+* 如果委托是验证人的操作者且没有更多份额存在，则触发禁闭验证人
+* 更新验证人，删除委托人份额和相关的代币
+* 如果验证人状态为 `Bonded`，则将价值为 `Coins` 的未质押份额从 `BondedPool` 转移到 `NotBondedPool` `ModuleAccount`
+* 如果验证人已解质押且没有更多委托份额，则删除验证人
+* 如果验证人已解质押且没有更多委托份额，则删除验证人
+* 获取唯一的 `unbondingId` 并将其映射到 `UnbondingDelegationByUnbondingId` 中的 `UnbondingDelegationEntry`
+* 调用 `AfterUnbondingInitiated(unbondingId)` 钩子
+* 将解质押委托添加到 `UnbondingDelegationQueue`，完成时间设置为 `UnbondingTime`
+
+#### 取消“解绑委托”条目
+
+当发生“取消解绑委托”时，将同时更新“验证人”、“委托”和“解绑委托队列”状态。
+
+- 如果取消解绑委托的金额等于“解绑委托”条目的余额，则从“解绑委托队列”中删除“解绑委托”条目。
+- 如果取消解绑委托的金额小于“解绑委托”条目的余额，则在“解绑委托队列”中更新“解绑委托”条目的新余额。
+- 取消的金额将被[委托](#delegations)回原始的“验证人”。
+
+#### 完成解绑
+
+对于未立即完成的解绑委托，当解绑委托队列元素到期时，将执行以下操作：
+
+- 从“解绑委托”对象中移除该条目。
+- 将代币从“NotBondedPool”模块账户转移到委托人的账户。
+
+#### 开始重新委托
+
+重新委托会影响委托、源验证人和目标验证人。
+
+- 从源验证人处执行“解绑”委托以取回解绑份额所对应的代币。
+- 使用解绑的代币，将其“委托”给目标验证人。
+- 如果“源验证人”的状态为“Bonded”，而“目标验证人”的状态不是，“委托”给目标验证人的代币将从“BondedPool”转移到“NotBondedPool”模块账户。
+- 否则，如果“源验证人”的状态不是“Bonded”，而“目标验证人”的状态是“Bonded”，将从“NotBondedPool”转移新委托的代币到“BondedPool”模块账户。
+- 在相关的“重新委托”中记录代币金额的新条目。
+
+从重新委托开始到完成的过程中，委托人处于“伪解绑”状态，仍然可能因重新委托开始之前发生的违规行为而被处罚。
+
+#### 完成重新委托
+
+当重新委托完成时，将执行以下操作：
+
+- 从“重新委托”对象中移除该条目。
+
+### 惩罚
+
+#### 惩罚验证人
+
+当验证人被惩罚时，会发生以下情况：
+
+* 总的`slashAmount`被计算为`slashFactor`（链参数）乘以`TokensFromConsensusPower`，即违规时绑定到验证人的总代币数量。
+* 每个未解绑委托和伪未解绑再委托，如果违规发生在解绑或再委托开始之前，将按照`initialBalance`的`slashFactor`百分比进行惩罚。
+* 从再委托和未解绑委托中扣除的每个金额将从总的惩罚金额中减去。
+* 然后，`remainingSlashAmount`将从验证人在`BondedPool`或`NonBondedPool`中的代币中进行惩罚，具体取决于验证人的状态。这将减少代币的总供应量。
+
+对于任何需要提交证据的违规行为（例如双签名）导致的惩罚，惩罚发生在包含证据的区块，而不是违规发生的区块。
+换句话说，验证人不会被追溯地惩罚，只有在被抓到时才会受到惩罚。
+
+#### 惩罚未解绑委托
+
+当验证人受到惩罚时，从验证人开始解绑的未解绑委托也会受到惩罚。
+从验证人的每个未解绑委托中的每个条目都会受到`slashFactor`的惩罚。惩罚金额是根据委托的`InitialBalance`计算的，并且有上限，以防止结果为负数。已完成（或成熟）的解绑不会受到惩罚。
+
+#### 惩罚再委托
+
+当验证人受到惩罚时，从验证人开始的所有再委托也会受到惩罚。
+再委托会受到`slashFactor`的惩罚。在违规发生之前开始的再委托不会受到惩罚。
+惩罚金额是根据委托的`InitialBalance`计算的，并且有上限，以防止结果为负数。已完成伪未解绑的成熟再委托不会受到惩罚。
+
+### 如何计算份额
+
+在任何给定的时间点，每个验证人都有一定数量的代币`T`，并发行了一定数量的份额`S`。
+每个委托人`i`持有一定数量的份额`S_i`。
+代币的数量是所有委托给验证人的代币总和，加上奖励，减去惩罚。
+
+委托人有权获得与其份额比例相对应的基础代币部分。因此，委托人 `i` 有权获得验证人的代币的 `T * S_i / S` 部分。
+
+当委托人向验证人委托新的代币时，他们会获得与其贡献成比例的份额。因此，当委托人 `j` 委托了 `T_j` 个代币时，他们会获得 `S_j = S * T_j / T` 份额。现在，总代币数为 `T + T_j`，总份额数为 `S + S_j`。委托人 `j` 的份额比例与其贡献的总代币比例相同：`(S + S_j) / S = (T + T_j) / T`。
+
+特殊情况是初始委托，当 `T = 0` 且 `S = 0` 时，`T_j / T` 未定义。对于初始委托，委托 `T_j` 个代币的委托人 `j` 将获得 `S_j = T_j` 份额。因此，一个未收到任何奖励且未被惩罚的验证人将具有 `T = S`。
+
+## 消息
+
+在本节中，我们描述了质押消息的处理以及状态的相应更新。每个消息指定的所有创建/修改的状态对象在 [状态](#state) 部分中定义。
+
+### MsgCreateValidator
+
+使用 `MsgCreateValidator` 消息创建验证人。验证人必须由操作员进行初始委托。
+
+```protobuf reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/proto/cosmos/staking/v1beta1/tx.proto#L20-L21
+```
+
+```protobuf reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/proto/cosmos/staking/v1beta1/tx.proto#L50-L73
+```
+
+如果出现以下情况，此消息预计会失败：
+
+* 具有此操作员地址的另一个验证人已注册
+* 具有此公钥的另一个验证人已注册
+* 初始自委托代币不是指定为绑定代币的 denom
+* 佣金参数有误，即：
+    * `MaxRate` 要么大于 1，要么小于 0
+    * 初始 `Rate` 要么为负数，要么大于 `MaxRate`
+    * 初始 `MaxChangeRate` 要么为负数，要么大于 `MaxRate`
+* 描述字段过大
+
+这条消息在适当的索引处创建并存储`Validator`对象。
+此外，使用初始代币委托代币`Delegation`进行自委托。
+验证人始终以未绑定状态开始，但可能在第一个结束块中绑定。
+
+### MsgEditValidator
+
+可以使用`MsgEditValidator`消息更新验证人的`Description`、`CommissionRate`。
+
+```protobuf reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/proto/cosmos/staking/v1beta1/tx.proto#L23-L24
+```
+
+```protobuf reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/proto/cosmos/staking/v1beta1/tx.proto#L78-L97
+```
+
+如果以下情况之一发生，此消息预计会失败：
+
+* 初始的`CommissionRate`为负数或大于`MaxRate`
+* `CommissionRate`在前24小时内已经更新过
+* `CommissionRate`大于`MaxChangeRate`
+* 描述字段过大
+
+此消息存储了更新后的`Validator`对象。
+
+### MsgDelegate
+
+在此消息中，委托人提供代币，并获得其验证人（新创建的）委托份额`Delegation.Shares`的一部分。
+
+```protobuf reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/proto/cosmos/staking/v1beta1/tx.proto#L26-L28
+```
+
+```protobuf reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/proto/cosmos/staking/v1beta1/tx.proto#L102-L114
+```
+
+如果以下情况之一发生，此消息预计会失败：
+
+* 验证人不存在
+* `Amount` `Coin`的面额与`params.BondDenom`定义的面额不同
+* 汇率无效，即验证人没有代币（由于惩罚），但存在未解除的份额
+* 委托的金额小于允许的最小委托金额
+
+如果提供的地址的现有`Delegation`对象尚不存在，则将其作为此消息的一部分创建，否则将更新现有的`Delegation`以包括新收到的份额。
+
+委托人以当前汇率获得新铸造的份额。
+汇率是验证人现有份额数除以当前委托的代币数。
+
+验证人在`ValidatorByPower`索引中进行更新，委托在`Validators`索引中跟踪。
+
+可以委托给被监禁的验证人，唯一的区别是在解除监禁之前不会将其添加到权力索引中。
+
+![委托序列](https://raw.githubusercontent.com/cosmos/cosmos-sdk/release/v0.46.x/docs/uml/svg/delegation_sequence.svg)
+
+### MsgUndelegate
+
+`MsgUndelegate`消息允许委托人从验证人那里撤销委托的代币。
+
+```protobuf reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/proto/cosmos/staking/v1beta1/tx.proto#L34-L36
+```
+
+```protobuf reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/proto/cosmos/staking/v1beta1/tx.proto#L140-L152
+```
+
+该消息返回一个包含解除委托完成时间的响应：
+
+```protobuf reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/proto/cosmos/staking/v1beta1/tx.proto#L154-L158
+```
+
+如果满足以下条件，该消息预计会失败：
+
+* 委托不存在
+* 验证人不存在
+* 委托的份额少于`Amount`所值的份额
+* 现有的`UnbondingDelegation`的条目数达到了`params.MaxEntries`定义的最大值
+* `Amount`的货币单位与`params.BondDenom`定义的单位不同
+
+当处理该消息时，会执行以下操作：
+
+* 验证人的`DelegatorShares`和委托的`Shares`都会减少`SharesAmount`所指定的份额
+* 计算被移除的份额所值的代币数量，并从验证人持有的代币中减去该数量
+* 对于被移除的代币，如果验证人的状态是：
+    * `Bonded` - 将它们添加到`UnbondingDelegation`的一个条目中（如果不存在，则创建`UnbondingDelegation`），完成时间为当前时间起的完整解绑期。更新池的份额，通过被移除的份额的代币数量减少`BondedTokens`并增加`NotBondedTokens`。
+    * `Unbonding` - 将它们添加到`UnbondingDelegation`的一个条目中（如果不存在，则创建`UnbondingDelegation`），完成时间与验证人的完成时间（`UnbondingMinTime`）相同。
+    * `Unbonded` - 将代币发送给消息中的`DelegatorAddr`
+* 如果委托中没有更多的`Shares`，则从存储中删除委托对象
+    * 在这种情况下，如果委托是验证人的自委托，则还会将验证人设置为被监禁状态。
+
+![解绑序列图](https://raw.githubusercontent.com/cosmos/cosmos-sdk/release/v0.46.x/docs/uml/svg/unbond_sequence.svg)
+
+### MsgCancelUnbondingDelegation
+
+`MsgCancelUnbondingDelegation`消息允许委托人取消`unbondingDelegation`条目并重新委托给先前的验证人。
+
+```protobuf reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/proto/cosmos/staking/v1beta1/tx.proto#L38-L42
+```
+
+```protobuf reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/proto/cosmos/staking/v1beta1/tx.proto#L160-L175
+```
+
+如果以下情况发生，此消息预计会失败：
+
+* `unbondingDelegation`条目已经处理。
+* `cancel unbonding delegation`金额大于`unbondingDelegation`条目余额。
+* `cancel unbonding delegation`高度在委托人的`unbondingDelegationQueue`中不存在。
+
+处理此消息时，将执行以下操作：
+
+* 如果`unbondingDelegation`条目余额为零
+    * 在此情况下，将从`unbondingDelegationQueue`中删除`unbondingDelegation`条目。
+    * 否则，将使用新的`unbondingDelegation`条目余额和初始余额更新`unbondingDelegationQueue`。
+* 验证人的`DelegatorShares`和委托的`Shares`都会增加`Amount`。
+
+### MsgBeginRedelegate
+
+重新委托命令允许委托人立即切换验证人。一旦解绑期过去，重新委托将在EndBlocker中自动完成。
+
+```protobuf reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/proto/cosmos/staking/v1beta1/tx.proto#L30-L32
+```
+
+```protobuf reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/proto/cosmos/staking/v1beta1/tx.proto#L119-L132
+```
+
+此消息返回一个包含重新委托完成时间的响应：
+
+```protobuf reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/proto/cosmos/staking/v1beta1/tx.proto#L133-L138
+```
+
+如果以下情况发生，此消息预计会失败：
+
+* 委托不存在
+* 源验证人或目标验证人不存在
+* 委托的份额少于`Amount`所值的份额
+* 源验证人具有未成熟的接收重新委托（即重新委托可能是传递性的）
+* 现有的`Redelegation`已达到`params.MaxEntries`定义的最大条目数
+* `Amount`的`Coin`的面额与`params.BondDenom`定义的面额不同
+
+当处理此消息时，会发生以下操作：
+
+* 源验证器的`DelegatorShares`和委托的`Shares`都会减少`SharesAmount`的数量。
+* 计算股份的代币价值，从源验证器中移除相应数量的代币。
+* 如果源验证器是：
+    * `Bonded` - 向`Redelegation`添加一个条目（如果不存在则创建`Redelegation`），完成时间为当前时间起的完整解绑期。更新池的股份，减少`BondedTokens`并增加`NotBondedTokens`，增加的数量为股份的代币价值（但在下一步可能会被逆转）。
+    * `Unbonding` - 向`Redelegation`添加一个条目（如果不存在则创建`Redelegation`），完成时间与验证器的(`UnbondingMinTime`)相同。
+    * `Unbonded` - 在此步骤中不需要执行任何操作。
+* 将代币价值委托给目标验证器，可能会将代币移回到已绑定状态。
+* 如果源委托中没有更多的`Shares`，则从存储中删除源委托对象。
+    * 在这种情况下，如果委托是验证器的自委托，则还会将验证器锁定。
+
+![开始重新委托序列](https://raw.githubusercontent.com/cosmos/cosmos-sdk/release/v0.46.x/docs/uml/svg/begin_redelegation_sequence.svg)
+
+
+### MsgUpdateParams
+
+`MsgUpdateParams`用于更新质押模块的参数。
+这些参数通过治理提案进行更新，签名者是治理模块的账户地址。
+
+```protobuf reference
+https://github.com/cosmos/cosmos-sdk/blob/v0.47.0-rc1/proto/cosmos/staking/v1beta1/tx.proto#L182-L195
+```
+
+如果出现以下情况，消息处理可能会失败：
+
+* 签名者不是质押保管者中定义的权限（通常是治理模块账户）。
+
+## Begin-Block
+
+每个 ABCI 的 begin block 调用都会根据`HistoricalEntries`参数存储和修剪历史信息。
+
+### 历史信息跟踪
+
+如果`HistoricalEntries`参数为0，则`BeginBlock`不执行任何操作。
+
+否则，最新的历史信息将存储在键`historicalInfoKey|height`下，而任何早于`height - HistoricalEntries`的条目将被删除。
+在大多数情况下，每个块只会修剪一个条目。
+但是，如果`HistoricalEntries`参数更改为较低的值，则存储中将有多个需要修剪的条目。
+
+## 结束区块
+
+每个 ABCI 结束区块调用时，指定要执行的更新队列和验证人集合更改操作。
+
+### 验证人集合更改
+
+在此过程中，通过在每个区块结束时运行的状态转换来更新质押验证人集合。作为此过程的一部分，任何更新的验证人也会返回给 CometBFT，以便包含在负责在共识层验证 CometBFT 消息的 CometBFT 验证人集合中。操作如下：
+
+* 新的验证人集合是从 `ValidatorsByPower` 索引中检索到的前 `params.MaxValidators` 个验证人
+* 将先前的验证人集合与新的验证人集合进行比较：
+    * 缺失的验证人开始解除质押，并将其 `Tokens` 从 `BondedPool` 转移到 `NotBondedPool` 的 `ModuleAccount`
+    * 新的验证人立即进行质押，并将其 `Tokens` 从 `NotBondedPool` 转移到 `BondedPool` 的 `ModuleAccount`
+
+在所有情况下，任何离开或进入质押验证人集合的验证人，或者在质押验证人集合内更改余额并保持不变，都会产生一个更新消息，报告其新的共识能力，该消息传递回 CometBFT。
+
+`LastTotalPower` 和 `LastValidatorsPower` 保存了上一个区块结束时的总能力和验证人能力的状态，并用于检查在 `ValidatorsByPower` 和总新能力中发生的更改，该能力在 `EndBlock` 过程中计算。
+
+### 队列
+
+在质押中，某些状态转换不是瞬时发生的，而是需要一段时间（通常是解除质押期）来完成。当这些转换成熟时，必须执行某些操作以完成状态操作。这是通过使用队列来实现的，这些队列在每个区块结束时进行检查/处理。
+
+#### 解除质押的验证人
+
+当验证人被踢出质押验证人集合（无论是因为被监禁还是没有足够的质押代币），它会开始解除质押过程，并且所有委托给该验证人的委托也会开始解除质押（同时仍然委托给该验证人）。此时，验证人被称为“解除质押的验证人”，在解除质押期过去后，它将成熟为“解除质押的验证人”。
+
+每个验证人队列块都要检查成熟的未绑定验证人（即完成时间 <= 当前时间且完成高度 <= 当前区块高度）。此时，状态中将删除所有没有剩余委托的成熟验证人。对于其他仍有剩余委托的成熟未绑定验证人，`validator.Status`将从`types.Unbonding`切换到`types.Unbonded`。
+
+外部模块可以通过`PutUnbondingOnHold(unbondingId)`方法暂停未绑定操作。因此，即使达到成熟状态，处于暂停状态的未绑定操作（例如，未绑定委托）也无法完成。对于具有`unbondingId`的未绑定操作最终要完成（在达到成熟状态后），每次调用`PutUnbondingOnHold(unbondingId)`都必须与调用`UnbondingCanComplete(unbondingId)`相匹配。
+
+#### 未绑定委托
+
+按照以下步骤完成`UnbondingDelegations`队列中所有成熟的`UnbondingDelegations.Entries`的未绑定委托：
+
+* 将余额币转移到委托人的钱包地址
+* 从`UnbondingDelegation.Entries`中删除成熟的条目
+* 如果没有剩余条目，则从存储中删除`UnbondingDelegation`对象。
+
+#### 重新委托
+
+按照以下步骤完成`Redelegations`队列中所有成熟的`Redelegation.Entries`的未绑定委托：
+
+* 从`Redelegation.Entries`中删除成熟的条目
+* 如果没有剩余条目，则从存储中删除`Redelegation`对象。
+
+## 钩子
+
+其他模块可以在staking中发生特定事件时注册要执行的操作。这些事件可以注册为在staking事件发生之前或之后执行（根据钩子名称）。以下钩子可以与staking一起注册：
+
+* `AfterValidatorCreated(Context, ValAddress) error`
+    * 在创建验证人时调用
+* `BeforeValidatorModified(Context, ValAddress) error`
+    * 在更改验证人状态时调用
+* `AfterValidatorRemoved(Context, ConsAddress, ValAddress) error`
+    * 在删除验证人时调用
+* `AfterValidatorBonded(Context, ConsAddress, ValAddress) error`
+    * 在验证人绑定时调用
+* `AfterValidatorBeginUnbonding(Context, ConsAddress, ValAddress) error`
+    * 在验证人开始解绑时调用
+* `BeforeDelegationCreated(Context, AccAddress, ValAddress) error`
+    * 在创建委托时调用
+* `BeforeDelegationSharesModified(Context, AccAddress, ValAddress) error`
+    * 在修改委托份额时调用
+* `AfterDelegationModified(Context, AccAddress, ValAddress) error`
+    * 在创建或修改委托时调用
+* `BeforeDelegationRemoved(Context, AccAddress, ValAddress) error`
+    * 在删除委托时调用
+* `AfterUnbondingInitiated(Context, UnbondingID)`
+    * 在发起解绑操作（验证人解绑、未绑定委托、重新委托）时调用
+
+## 事件
+
+staking 模块会触发以下事件：
+
+### EndBlocker
+
+| 类型                  | 属性键                | 属性值                      |
+| --------------------- | --------------------- | ------------------------- |
+| complete_unbonding    | amount                | {totalUnbondingAmount}    |
+| complete_unbonding    | validator             | {validatorAddress}        |
+| complete_unbonding    | delegator             | {delegatorAddress}        |
+| complete_redelegation | amount                | {totalRedelegationAmount} |
+| complete_redelegation | source_validator      | {srcValidatorAddress}     |
+| complete_redelegation | destination_validator | {dstValidatorAddress}     |
+| complete_redelegation | delegator             | {delegatorAddress}        |
+
+## Msg's
+
+### MsgCreateValidator
+
+| 类型             | 属性键 | 属性值    |
+| ---------------- | ------ | --------- |
+| create_validator | validator     | {validatorAddress} |
+| create_validator | amount        | {delegationAmount} |
+| message          | module        | staking            |
+| message          | action        | create_validator   |
+| message          | sender        | {senderAddress}    |
+
+### MsgEditValidator
+
+| 类型           | 属性键       | 属性值     |
+| -------------- | ------------ | ----------- |
+| edit_validator | commission_rate     | {commissionRate}    |
+| edit_validator | min_self_delegation | {minSelfDelegation} |
+| message        | module              | staking             |
+| message        | action              | edit_validator      |
+| message        | sender              | {senderAddress}     |
+
+### MsgDelegate
+
+| 类型     | 属性键 | 属性值    |
+| -------- | ------ | --------- |
+| delegate | validator     | {validatorAddress} |
+| delegate | amount        | {delegationAmount} |
+| message  | module        | staking            |
+| message  | action        | delegate           |
+| message  | sender        | {senderAddress}    |
+
+### MsgUndelegate
+
+| 类型    | 属性键       | 属性值    |
+| ------- | ------------------- | ------------------ |
+| unbond  | validator           | {validatorAddress} |
+| unbond  | amount              | {unbondAmount}     |
+| unbond  | completion_time [0] | {completionTime}   |
+| message | module              | staking            |
+| message | action              | begin_unbonding    |
+| message | sender              | {senderAddress}    |
+
+* [0] 时间格式遵循 RFC3339 标准
+
+### MsgCancelUnbondingDelegation
+
+| 类型                        | 属性键   | 属性值                   |
+| --------------------------- | --------------- | --------------------------------- |
+| cancel_unbonding_delegation | validator       | {validatorAddress}                |
+| cancel_unbonding_delegation | delegator       | {delegatorAddress}                |
+| cancel_unbonding_delegation | amount          | {cancelUnbondingDelegationAmount} |
+| cancel_unbonding_delegation | creation_height | {unbondingCreationHeight}         |
+| message                     | module          | staking                           |
+| message                     | action          | cancel_unbond                     |
+| message                     | sender          | {senderAddress}                   |
+
+### MsgBeginRedelegate
+
+| 类型       | 属性键         | 属性值       |
+| ---------- | --------------------- | --------------------- |
+| redelegate | source_validator      | {srcValidatorAddress} |
+| redelegate | destination_validator | {dstValidatorAddress} |
+| redelegate | amount                | {unbondAmount}        |
+| redelegate | completion_time [0]   | {completionTime}      |
+| message    | module                | staking               |
+| message    | action                | begin_redelegate      |
+| message    | sender                | {senderAddress}       |
+
+* [0] 时间格式遵循 RFC3339 标准
+
+## 参数
+
+staking 模块包含以下参数：
+
+| 键               | 类型             | 示例                |
+| ----------------- | ---------------- | ---------------------- |
+| UnbondingTime     | string (time ns) | "259200000000000"      |
+| MaxValidators     | uint16           | 100                    |
+| KeyMaxEntries     | uint16           | 7                      |
+| HistoricalEntries | uint16           | 3                      |
+| BondDenom         | string           | "stake"                |
+| MinCommissionRate | string           | "0.000000000000000000" |
+
+## 客户端
+
+### 命令行界面（CLI）
+
+用户可以使用命令行界面（CLI）查询和与 `staking` 模块进行交互。
+
+#### 查询
+
+`query` 命令允许用户查询 `staking` 状态。
+
+```bash
+simd query staking --help
+```
+
+##### 委托
+
+`delegation` 命令允许用户查询特定委托人在特定验证人上的委托。
+
+用法：
+
+```bash
+simd query staking delegation [delegator-addr] [validator-addr] [flags]
+```
+
+示例：
+
+```bash
+simd query staking delegation cosmos1gghjut3ccd8ay0zduzj64hwre2fxs9ld75ru9p cosmosvaloper1gghjut3ccd8ay0zduzj64hwre2fxs9ldmqhffj
+```
+
+示例输出：
+
+```bash
+balance:
+  amount: "10000000000"
+  denom: stake
+delegation:
+  delegator_address: cosmos1gghjut3ccd8ay0zduzj64hwre2fxs9ld75ru9p
+  shares: "10000000000.000000000000000000"
+  validator_address: cosmosvaloper1gghjut3ccd8ay0zduzj64hwre2fxs9ldmqhffj
+```
+
+##### 委托列表
+
+`delegations` 命令允许用户查询特定委托人在所有验证人上的委托。
+
+用法：
+
+```bash
+simd query staking delegations [delegator-addr] [flags]
+```
+
+示例：
+
+```bash
+simd query staking delegations cosmos1gghjut3ccd8ay0zduzj64hwre2fxs9ld75ru9p
+```
+
+示例输出：
+
+```bash
+delegation_responses:
+- balance:
+    amount: "10000000000"
+    denom: stake
+  delegation:
+    delegator_address: cosmos1gghjut3ccd8ay0zduzj64hwre2fxs9ld75ru9p
+    shares: "10000000000.000000000000000000"
+    validator_address: cosmosvaloper1gghjut3ccd8ay0zduzj64hwre2fxs9ldmqhffj
+- balance:
+    amount: "10000000000"
+    denom: stake
+  delegation:
+    delegator_address: cosmos1gghjut3ccd8ay0zduzj64hwre2fxs9ld75ru9p
+    shares: "10000000000.000000000000000000"
+    validator_address: cosmosvaloper1x20lytyf6zkcrv5edpkfkn8sz578qg5sqfyqnp
+pagination:
+  next_key: null
+  total: "0"
+```
+
+##### 委托给
+
+`delegations-to` 命令允许用户查询特定验证人上的委托。
+
+用法：
+
+```bash
+simd query staking delegations-to [validator-addr] [flags]
+```
+
+示例：
+
+```bash
+simd query staking delegations-to cosmosvaloper1gghjut3ccd8ay0zduzj64hwre2fxs9ldmqhffj
+```
+
+示例输出：
+
+```bash
+- balance:
+    amount: "504000000"
+    denom: stake
+  delegation:
+    delegator_address: cosmos1q2qwwynhv8kh3lu5fkeex4awau9x8fwt45f5cp
+    shares: "504000000.000000000000000000"
+    validator_address: cosmosvaloper1gghjut3ccd8ay0zduzj64hwre2fxs9ldmqhffj
+- balance:
+    amount: "78125000000"
+    denom: uixo
+  delegation:
+    delegator_address: cosmos1qvppl3479hw4clahe0kwdlfvf8uvjtcd99m2ca
+    shares: "78125000000.000000000000000000"
+    validator_address: cosmosvaloper1gghjut3ccd8ay0zduzj64hwre2fxs9ldmqhffj
+pagination:
+  next_key: null
+  total: "0"
+```
+
+##### 历史信息
+
+`historical-info` 命令允许用户查询给定高度的历史信息。
+
+用法：
+
+```bash
+simd query staking historical-info [height] [flags]
+```
+
+示例：
+
+```bash
+simd query staking historical-info 10
+```
+
+示例输出：
+
+```bash
+header:
+  app_hash: Lbx8cXpI868wz8sgp4qPYVrlaKjevR5WP/IjUxwp3oo=
+  chain_id: testnet
+  consensus_hash: BICRvH3cKD93v7+R1zxE2ljD34qcvIZ0Bdi389qtoi8=
+  data_hash: 47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=
+  evidence_hash: 47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=
+  height: "10"
+  last_block_id:
+    hash: RFbkpu6pWfSThXxKKl6EZVDnBSm16+U0l0xVjTX08Fk=
+    part_set_header:
+      hash: vpIvXD4rxD5GM4MXGz0Sad9I7//iVYLzZsEU4BVgWIU=
+      total: 1
+  last_commit_hash: Ne4uXyx4QtNp4Zx89kf9UK7oG9QVbdB6e7ZwZkhy8K0=
+  last_results_hash: 47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=
+  next_validators_hash: nGBgKeWBjoxeKFti00CxHsnULORgKY4LiuQwBuUrhCs=
+  proposer_address: mMEP2c2IRPLr99LedSRtBg9eONM=
+  time: "2021-10-01T06:00:49.785790894Z"
+  validators_hash: nGBgKeWBjoxeKFti00CxHsnULORgKY4LiuQwBuUrhCs=
+  version:
+    app: "0"
+    block: "11"
+valset:
+- commission:
+    commission_rates:
+      max_change_rate: "0.010000000000000000"
+      max_rate: "0.200000000000000000"
+      rate: "0.100000000000000000"
+    update_time: "2021-10-01T05:52:50.380144238Z"
+  consensus_pubkey:
+    '@type': /cosmos.crypto.ed25519.PubKey
+    key: Auxs3865HpB/EfssYOzfqNhEJjzys2Fo6jD5B8tPgC8=
+  delegator_shares: "10000000.000000000000000000"
+  description:
+    details: ""
+    identity: ""
+    moniker: myvalidator
+    security_contact: ""
+    website: ""
+  jailed: false
+  min_self_delegation: "1"
+  operator_address: cosmosvaloper1rne8lgs98p0jqe82sgt0qr4rdn4hgvmgp9ggcc
+  status: BOND_STATUS_BONDED
+  tokens: "10000000"
+  unbonding_height: "0"
+  unbonding_time: "1970-01-01T00:00:00Z"
+```
+
+##### 参数
+
+`params` 命令允许用户查询设置为staking参数的值。
+
+用法：
+
+```bash
+simd query staking params [flags]
+```
+
+示例：
+
+```bash
+simd query staking params
+```
+
+示例输出：
+
+```bash
+bond_denom: stake
+historical_entries: 10000
+max_entries: 7
+max_validators: 50
+unbonding_time: 1814400s
+```
+
+##### 资金池
+
+`pool` 命令允许用户查询存储在staking池中的金额值。
+
+用法：
+
+```bash
+simd q staking pool [flags]
+```
+
+示例：
+
+```bash
+simd q staking pool
+```
+
+```bash
+bonded_tokens: "10000000"
+not_bonded_tokens: "0"
+```
+
+##### redelegation
+
+`redelegation`命令允许用户根据委托人、源验证人地址和目标验证人地址查询重新委托记录。
+
+用法：
+
+```bash
+simd query staking redelegation [delegator-addr] [src-validator-addr] [dst-validator-addr] [flags]
+```
+
+示例：
+
+```bash
+simd query staking redelegation cosmos1gghjut3ccd8ay0zduzj64hwre2fxs9ld75ru9p cosmosvaloper1l2rsakp388kuv9k8qzq6lrm9taddae7fpx59wm cosmosvaloper1gghjut3ccd8ay0zduzj64hwre2fxs9ldmqhffj
+```
+
+示例输出：
+
+```bash
+pagination: null
+redelegation_responses:
+- entries:
+  - balance: "50000000"
+    redelegation_entry:
+      completion_time: "2021-10-24T20:33:21.960084845Z"
+      creation_height: 2.382847e+06
+      initial_balance: "50000000"
+      shares_dst: "50000000.000000000000000000"
+  - balance: "5000000000"
+    redelegation_entry:
+      completion_time: "2021-10-25T21:33:54.446846862Z"
+      creation_height: 2.397271e+06
+      initial_balance: "5000000000"
+      shares_dst: "5000000000.000000000000000000"
+  redelegation:
+    delegator_address: cosmos1gghjut3ccd8ay0zduzj64hwre2fxs9ld75ru9p
+    entries: null
+    validator_dst_address: cosmosvaloper1l2rsakp388kuv9k8qzq6lrm9taddae7fpx59wm
+    validator_src_address: cosmosvaloper1l2rsakp388kuv9k8qzq6lrm9taddae7fpx59wm
+```
+
+##### redelegations
+
+`redelegations`命令允许用户查询一个委托人的所有重新委托记录。
+
+用法：
+
+```bash
+simd query staking redelegations [delegator-addr] [flags]
+```
+
+示例：
+
+```bash
+simd query staking redelegation cosmos1gghjut3ccd8ay0zduzj64hwre2fxs9ld75ru9p
+```
+
+示例输出：
+
+```bash
+pagination:
+  next_key: null
+  total: "0"
+redelegation_responses:
+- entries:
+  - balance: "50000000"
+    redelegation_entry:
+      completion_time: "2021-10-24T20:33:21.960084845Z"
+      creation_height: 2.382847e+06
+      initial_balance: "50000000"
+      shares_dst: "50000000.000000000000000000"
+  - balance: "5000000000"
+    redelegation_entry:
+      completion_time: "2021-10-25T21:33:54.446846862Z"
+      creation_height: 2.397271e+06
+      initial_balance: "5000000000"
+      shares_dst: "5000000000.000000000000000000"
+  redelegation:
+    delegator_address: cosmos1gghjut3ccd8ay0zduzj64hwre2fxs9ld75ru9p
+    entries: null
+    validator_dst_address: cosmosvaloper1uccl5ugxrm7vqlzwqr04pjd320d2fz0z3hc6vm
+    validator_src_address: cosmosvaloper1zppjyal5emta5cquje8ndkpz0rs046m7zqxrpp
+- entries:
+  - balance: "562770000000"
+    redelegation_entry:
+      completion_time: "2021-10-25T21:42:07.336911677Z"
+      creation_height: 2.39735e+06
+      initial_balance: "562770000000"
+      shares_dst: "562770000000.000000000000000000"
+  redelegation:
+    delegator_address: cosmos1gghjut3ccd8ay0zduzj64hwre2fxs9ld75ru9p
+    entries: null
+    validator_dst_address: cosmosvaloper1uccl5ugxrm7vqlzwqr04pjd320d2fz0z3hc6vm
+    validator_src_address: cosmosvaloper1zppjyal5emta5cquje8ndkpz0rs046m7zqxrpp
+```
+
+##### redelegations-from
+
+`redelegations-from`命令允许用户查询正在从验证人重新委托的委托。
+
+用法：
+
+```bash
+simd query staking redelegations-from [validator-addr] [flags]
+```
+
+示例：
+
+```bash
+simd query staking redelegations-from cosmosvaloper1y4rzzrgl66eyhzt6gse2k7ej3zgwmngeleucjy
+```
+
+示例输出：
+
+```bash
+pagination:
+  next_key: null
+  total: "0"
+redelegation_responses:
+- entries:
+  - balance: "50000000"
+    redelegation_entry:
+      completion_time: "2021-10-24T20:33:21.960084845Z"
+      creation_height: 2.382847e+06
+      initial_balance: "50000000"
+      shares_dst: "50000000.000000000000000000"
+  - balance: "5000000000"
+    redelegation_entry:
+      completion_time: "2021-10-25T21:33:54.446846862Z"
+      creation_height: 2.397271e+06
+      initial_balance: "5000000000"
+      shares_dst: "5000000000.000000000000000000"
+  redelegation:
+    delegator_address: cosmos1pm6e78p4pgn0da365plzl4t56pxy8hwtqp2mph
+    entries: null
+    validator_dst_address: cosmosvaloper1uccl5ugxrm7vqlzwqr04pjd320d2fz0z3hc6vm
+    validator_src_address: cosmosvaloper1y4rzzrgl66eyhzt6gse2k7ej3zgwmngeleucjy
+- entries:
+  - balance: "221000000"
+    redelegation_entry:
+      completion_time: "2021-10-05T21:05:45.669420544Z"
+      creation_height: 2.120693e+06
+      initial_balance: "221000000"
+      shares_dst: "221000000.000000000000000000"
+  redelegation:
+    delegator_address: cosmos1zqv8qxy2zgn4c58fz8jt8jmhs3d0attcussrf6
+    entries: null
+    validator_dst_address: cosmosvaloper10mseqwnwtjaqfrwwp2nyrruwmjp6u5jhah4c3y
+    validator_src_address: cosmosvaloper1y4rzzrgl66eyhzt6gse2k7ej3zgwmngeleucjy
+```
+
+##### unbonding-delegation
+
+`unbonding-delegation`命令允许用户查询一个委托人在一个验证人上的解委托。
+
+用法：
+
+```bash
+simd query staking unbonding-delegation [delegator-addr] [validator-addr] [flags]
+```
+
+示例：
+
+```bash
+simd query staking unbonding-delegation cosmos1gghjut3ccd8ay0zduzj64hwre2fxs9ld75ru9p cosmosvaloper1gghjut3ccd8ay0zduzj64hwre2fxs9ldmqhffj
+```
+
+示例输出：
+
+```bash
+delegator_address: cosmos1gghjut3ccd8ay0zduzj64hwre2fxs9ld75ru9p
+entries:
+- balance: "52000000"
+  completion_time: "2021-11-02T11:35:55.391594709Z"
+  creation_height: "55078"
+  initial_balance: "52000000"
+validator_address: cosmosvaloper1gghjut3ccd8ay0zduzj64hwre2fxs9ldmqhffj
+```
+
+##### unbonding-delegations
+
+`unbonding-delegations`命令允许用户查询一个委托人的所有解委托记录。
+
+用法：
+
+```bash
+simd query staking unbonding-delegations [delegator-addr] [flags]
+```
+
+```bash
+simd查询质押解绑委托 cosmos1gghjut3ccd8ay0zduzj64hwre2fxs9ld75ru9p
+```
+
+示例输出：
+
+```bash
+pagination:
+  next_key: null
+  total: "0"
+unbonding_responses:
+- delegator_address: cosmos1gghjut3ccd8ay0zduzj64hwre2fxs9ld75ru9p
+  entries:
+  - balance: "52000000"
+    completion_time: "2021-11-02T11:35:55.391594709Z"
+    creation_height: "55078"
+    initial_balance: "52000000"
+  validator_address: cosmosvaloper1t8ehvswxjfn3ejzkjtntcyrqwvmvuknzmvtaaa
+
+```
+
+##### unbonding-delegations-from
+
+`unbonding-delegations-from`命令允许用户查询从验证人解绑委托的委托。
+
+用法：
+
+```bash
+simd查询质押解绑委托从 [验证人地址] [标志]
+```
+
+示例：
+
+```bash
+simd查询质押解绑委托从 cosmosvaloper1gghjut3ccd8ay0zduzj64hwre2fxs9ldmqhffj
+```
+
+示例输出：
+
+```bash
+pagination:
+  next_key: null
+  total: "0"
+unbonding_responses:
+- delegator_address: cosmos1qqq9txnw4c77sdvzx0tkedsafl5s3vk7hn53fn
+  entries:
+  - balance: "150000000"
+    completion_time: "2021-11-01T21:41:13.098141574Z"
+    creation_height: "46823"
+    initial_balance: "150000000"
+  validator_address: cosmosvaloper1gghjut3ccd8ay0zduzj64hwre2fxs9ldmqhffj
+- delegator_address: cosmos1peteje73eklqau66mr7h7rmewmt2vt99y24f5z
+  entries:
+  - balance: "24000000"
+    completion_time: "2021-10-31T02:57:18.192280361Z"
+    creation_height: "21516"
+    initial_balance: "24000000"
+  validator_address: cosmosvaloper1gghjut3ccd8ay0zduzj64hwre2fxs9ldmqhffj
+```
+
+##### validator
+
+`validator`命令允许用户查询有关单个验证人的详细信息。
+
+用法：
+
+```bash
+simd查询质押验证人 [验证人地址] [标志]
+```
+
+示例：
+
+```bash
+simd查询质押验证人 cosmosvaloper1gghjut3ccd8ay0zduzj64hwre2fxs9ldmqhffj
+```
+
+示例输出：
+
+```bash
+commission:
+  commission_rates:
+    max_change_rate: "0.020000000000000000"
+    max_rate: "0.200000000000000000"
+    rate: "0.050000000000000000"
+  update_time: "2021-10-01T19:24:52.663191049Z"
+consensus_pubkey:
+  '@type': /cosmos.crypto.ed25519.PubKey
+  key: sIiexdJdYWn27+7iUHQJDnkp63gq/rzUq1Y+fxoGjXc=
+delegator_shares: "32948270000.000000000000000000"
+description:
+  details: Witval is the validator arm from Vitwit. Vitwit is into software consulting
+    and services business since 2015. We are working closely with Cosmos ecosystem
+    since 2018. We are also building tools for the ecosystem, Aneka is our explorer
+    for the cosmos ecosystem.
+  identity: 51468B615127273A
+  moniker: Witval
+  security_contact: ""
+  website: ""
+jailed: false
+min_self_delegation: "1"
+operator_address: cosmosvaloper1gghjut3ccd8ay0zduzj64hwre2fxs9ldmqhffj
+status: BOND_STATUS_BONDED
+tokens: "32948270000"
+unbonding_height: "0"
+unbonding_time: "1970-01-01T00:00:00Z"
+```
+
+##### validators
+
+`validators`命令允许用户查询网络上所有验证人的详细信息。
+
+用法：
+
+```bash
+simd查询质押验证人 [标志]
+```
+
+示例：
+
+```bash
+simd查询质押验证人
+```
+
+示例输出：
+
+```bash
+pagination:
+  next_key: FPTi7TKAjN63QqZh+BaXn6gBmD5/
+  total: "0"
+validators:
+commission:
+  commission_rates:
+    max_change_rate: "0.020000000000000000"
+    max_rate: "0.200000000000000000"
+    rate: "0.050000000000000000"
+  update_time: "2021-10-01T19:24:52.663191049Z"
+consensus_pubkey:
+  '@type': /cosmos.crypto.ed25519.PubKey
+  key: sIiexdJdYWn27+7iUHQJDnkp63gq/rzUq1Y+fxoGjXc=
+delegator_shares: "32948270000.000000000000000000"
+description:
+    details: Witval is the validator arm from Vitwit. Vitwit is into software consulting
+      and services business since 2015. We are working closely with Cosmos ecosystem
+      since 2018. We are also building tools for the ecosystem, Aneka is our explorer
+      for the cosmos ecosystem.
+    identity: 51468B615127273A
+    moniker: Witval
+    security_contact: ""
+    website: ""
+  jailed: false
+  min_self_delegation: "1"
+  operator_address: cosmosvaloper1gghjut3ccd8ay0zduzj64hwre2fxs9ldmqhffj
+  status: BOND_STATUS_BONDED
+  tokens: "32948270000"
+  unbonding_height: "0"
+  unbonding_time: "1970-01-01T00:00:00Z"
+- commission:
+    commission_rates:
+      max_change_rate: "0.100000000000000000"
+      max_rate: "0.200000000000000000"
+      rate: "0.050000000000000000"
+    update_time: "2021-10-04T18:02:21.446645619Z"
+  consensus_pubkey:
+    '@type': /cosmos.crypto.ed25519.PubKey
+    key: GDNpuKDmCg9GnhnsiU4fCWktuGUemjNfvpCZiqoRIYA=
+  delegator_shares: "559343421.000000000000000000"
+  description:
+    details: Noderunners is a professional validator in POS networks. We have a huge
+      node running experience, reliable soft and hardware. Our commissions are always
+      low, our support to delegators is always full. Stake with us and start receiving
+      your Cosmos rewards now!
+    identity: 812E82D12FEA3493
+    moniker: Noderunners
+    security_contact: info@noderunners.biz
+    website: http://noderunners.biz
+  jailed: false
+  min_self_delegation: "1"
+  operator_address: cosmosvaloper1q5ku90atkhktze83j9xjaks2p7uruag5zp6wt7
+  status: BOND_STATUS_BONDED
+  tokens: "559343421"
+  unbonding_height: "0"
+  unbonding_time: "1970-01-01T00:00:00Z"
+```
+
+#### 交易
+
+`tx`命令允许用户与`staking`模块进行交互。
+
+```bash
+simd tx质押 --help
+```
+
+##### create-validator
+
+`create-validator`命令允许用户创建一个新的验证人，并对其进行自委托初始化。
+
+用法：
+
+```bash
+simd tx质押创建验证人 [路径/到/验证人.json] [标志]
+```
+
+示例：
+
+```bash
+simd tx staking create-validator /path/to/validator.json \
+  --chain-id="name_of_chain_id" \
+  --gas="auto" \
+  --gas-adjustment="1.2" \
+  --gas-prices="0.025stake" \
+  --from=mykey
+```
+
+其中`validator.json`包含：
+
+```json
+{
+  "pubkey": {"@type":"/cosmos.crypto.ed25519.PubKey","key":"BnbwFpeONLqvWqJb3qaUbL5aoIcW3fSuAp9nT3z5f20="},
+  "amount": "1000000stake",
+  "moniker": "my-moniker",
+  "website": "https://myweb.site",
+  "security": "security-contact@gmail.com",
+  "details": "description of your validator",
+  "commission-rate": "0.10",
+  "commission-max-rate": "0.20",
+  "commission-max-change-rate": "0.01",
+  "min-self-delegation": "1"
+}
+```
+
+pubkey可以通过使用`simd tendermint show-validator`命令获得。
+
+##### delegate
+
+`delegate`命令允许用户向验证人委托流动性代币。
+
+用法：
+
+```bash
+simd tx质押委托 [验证人地址] [金额] [标志]
+```
+
+示例：
+
+```bash
+simd tx质押委托 cosmosvaloper1l2rsakp388kuv9k8qzq6lrm9taddae7fpx59wm 1000stake --from mykey
+```
+
+##### edit-validator
+
+`edit-validator`命令允许用户编辑现有的验证人账户。
+
+用法：
+
+```bash
+simd tx staking edit-validator [flags]
+```
+
+示例：
+
+```bash
+simd tx staking edit-validator --moniker "new_moniker_name" --website "new_webiste_url" --from mykey
+```
+
+##### 重新委托
+
+`redelegate` 命令允许用户将非流动性代币从一个验证人重新委托到另一个验证人。
+
+用法：
+
+```bash
+simd tx staking redelegate [src-validator-addr] [dst-validator-addr] [amount] [flags]
+```
+
+示例：
+
+```bash
+simd tx staking redelegate cosmosvaloper1gghjut3ccd8ay0zduzj64hwre2fxs9ldmqhffj cosmosvaloper1l2rsakp388kuv9k8qzq6lrm9taddae7fpx59wm 100stake --from mykey
+```
+
+##### 解绑
+
+`unbond` 命令允许用户从验证人解绑份额。
+
+用法：
+
+```bash
+simd tx staking unbond [validator-addr] [amount] [flags]
+```
+
+示例：
+
+```bash
+simd tx staking unbond cosmosvaloper1gghjut3ccd8ay0zduzj64hwre2fxs9ldmqhffj 100stake --from mykey
+```
+
+##### 取消解绑
+
+`cancel-unbond` 命令允许用户取消解绑委托并重新委托给原始验证人。
+
+用法：
+
+```bash
+simd tx staking cancel-unbond [validator-addr] [amount] [creation-height]
+```
+
+示例：
+
+```bash
+simd tx staking cancel-unbond cosmosvaloper1gghjut3ccd8ay0zduzj64hwre2fxs9ldmqhffj 100stake 123123 --from mykey
+```
+
+
+### gRPC
+
+用户可以使用 gRPC 端点查询 `staking` 模块。
+
+#### 验证人
+
+`Validators` 端点查询与给定状态匹配的所有验证人。
+
+```bash
+cosmos.staking.v1beta1.Query/Validators
+```
+
+示例：
+
+```bash
+grpcurl -plaintext localhost:9090 cosmos.staking.v1beta1.Query/Validators
+```
+
+示例输出：
+
+```bash
+{
+  "validators": [
+    {
+      "operatorAddress": "cosmosvaloper1rne8lgs98p0jqe82sgt0qr4rdn4hgvmgp9ggcc",
+      "consensusPubkey": {"@type":"/cosmos.crypto.ed25519.PubKey","key":"Auxs3865HpB/EfssYOzfqNhEJjzys2Fo6jD5B8tPgC8="},
+      "status": "BOND_STATUS_BONDED",
+      "tokens": "10000000",
+      "delegatorShares": "10000000000000000000000000",
+      "description": {
+        "moniker": "myvalidator"
+      },
+      "unbondingTime": "1970-01-01T00:00:00Z",
+      "commission": {
+        "commissionRates": {
+          "rate": "100000000000000000",
+          "maxRate": "200000000000000000",
+          "maxChangeRate": "10000000000000000"
+        },
+        "updateTime": "2021-10-01T05:52:50.380144238Z"
+      },
+      "minSelfDelegation": "1"
+    }
+  ],
+  "pagination": {
+    "total": "1"
+  }
+}
+```
+
+#### 验证人
+
+`Validator` 端点查询给定验证人地址的验证人信息。
+
+```bash
+cosmos.staking.v1beta1.Query/Validator
+```
+
+示例：
+
+```bash
+grpcurl -plaintext -d '{"validator_addr":"cosmosvaloper1rne8lgs98p0jqe82sgt0qr4rdn4hgvmgp9ggcc"}' \
+localhost:9090 cosmos.staking.v1beta1.Query/Validator
+```
+
+示例输出：
+
+```bash
+{
+  "validator": {
+    "operatorAddress": "cosmosvaloper1rne8lgs98p0jqe82sgt0qr4rdn4hgvmgp9ggcc",
+    "consensusPubkey": {"@type":"/cosmos.crypto.ed25519.PubKey","key":"Auxs3865HpB/EfssYOzfqNhEJjzys2Fo6jD5B8tPgC8="},
+    "status": "BOND_STATUS_BONDED",
+    "tokens": "10000000",
+    "delegatorShares": "10000000000000000000000000",
+    "description": {
+      "moniker": "myvalidator"
+    },
+    "unbondingTime": "1970-01-01T00:00:00Z",
+    "commission": {
+      "commissionRates": {
+        "rate": "100000000000000000",
+        "maxRate": "200000000000000000",
+        "maxChangeRate": "10000000000000000"
+      },
+      "updateTime": "2021-10-01T05:52:50.380144238Z"
+    },
+    "minSelfDelegation": "1"
+  }
+}
+```
+
+#### 验证人委托
+
+`ValidatorDelegations` 端点查询给定验证人的委托信息。
+
+```bash
+cosmos.staking.v1beta1.Query/ValidatorDelegations
+```
+
+示例：
+
+```bash
+grpcurl -plaintext -d '{"validator_addr":"cosmosvaloper1rne8lgs98p0jqe82sgt0qr4rdn4hgvmgp9ggcc"}' \
+localhost:9090 cosmos.staking.v1beta1.Query/ValidatorDelegations
+```
+
+示例输出：
+
+```bash
+{
+  "delegationResponses": [
+    {
+      "delegation": {
+        "delegatorAddress": "cosmos1rne8lgs98p0jqe82sgt0qr4rdn4hgvmgy3ua5t",
+        "validatorAddress": "cosmosvaloper1rne8lgs98p0jqe82sgt0qr4rdn4hgvmgp9ggcc",
+        "shares": "10000000000000000000000000"
+      },
+      "balance": {
+        "denom": "stake",
+        "amount": "10000000"
+      }
+    }
+  ],
+  "pagination": {
+    "total": "1"
+  }
+}
+```
+
+#### ValidatorUnbondingDelegations
+
+`ValidatorUnbondingDelegations` 端点查询给定验证人的委托信息。
+
+```bash
+cosmos.staking.v1beta1.Query/ValidatorUnbondingDelegations
+```
+
+示例：
+
+```bash
+grpcurl -plaintext -d '{"validator_addr":"cosmosvaloper1rne8lgs98p0jqe82sgt0qr4rdn4hgvmgp9ggcc"}' \
+localhost:9090 cosmos.staking.v1beta1.Query/ValidatorUnbondingDelegations
+```
+
+示例输出：
+
+```bash
+{
+  "unbonding_responses": [
+    {
+      "delegator_address": "cosmos1z3pzzw84d6xn00pw9dy3yapqypfde7vg6965fy",
+      "validator_address": "cosmosvaloper1rne8lgs98p0jqe82sgt0qr4rdn4hgvmgp9ggcc",
+      "entries": [
+        {
+          "creation_height": "25325",
+          "completion_time": "2021-10-31T09:24:36.797320636Z",
+          "initial_balance": "20000000",
+          "balance": "20000000"
+        }
+      ]
+    },
+    {
+      "delegator_address": "cosmos1y8nyfvmqh50p6ldpzljk3yrglppdv3t8phju77",
+      "validator_address": "cosmosvaloper1rne8lgs98p0jqe82sgt0qr4rdn4hgvmgp9ggcc",
+      "entries": [
+        {
+          "creation_height": "13100",
+          "completion_time": "2021-10-30T12:53:02.272266791Z",
+          "initial_balance": "1000000",
+          "balance": "1000000"
+        }
+      ]
+    },
+  ],
+  "pagination": {
+    "next_key": null,
+    "total": "8"
+  }
+}
+```
+
+#### Delegation
+
+`Delegation` 端点查询给定验证人和委托人对的委托信息。
+
+```bash
+cosmos.staking.v1beta1.Query/Delegation
+```
+
+示例：
+
+```bash
+grpcurl -plaintext \
+-d '{"delegator_addr": "cosmos1y8nyfvmqh50p6ldpzljk3yrglppdv3t8phju77", validator_addr":"cosmosvaloper1rne8lgs98p0jqe82sgt0qr4rdn4hgvmgp9ggcc"}' \
+localhost:9090 cosmos.staking.v1beta1.Query/Delegation
+```
+
+示例输出：
+
+```bash
+{
+  "delegation_response":
+  {
+    "delegation":
+      {
+        "delegator_address":"cosmos1y8nyfvmqh50p6ldpzljk3yrglppdv3t8phju77",
+        "validator_address":"cosmosvaloper1rne8lgs98p0jqe82sgt0qr4rdn4hgvmgp9ggcc",
+        "shares":"25083119936.000000000000000000"
+      },
+    "balance":
+      {
+        "denom":"stake",
+        "amount":"25083119936"
+      }
+  }
+}
+```
+
+#### UnbondingDelegation
+
+`UnbondingDelegation` 端点查询给定验证人和委托人的解绑信息。
+
+```bash
+cosmos.staking.v1beta1.Query/UnbondingDelegation
+```
+
+示例：
+
+```bash
+grpcurl -plaintext \
+-d '{"delegator_addr": "cosmos1y8nyfvmqh50p6ldpzljk3yrglppdv3t8phju77", validator_addr":"cosmosvaloper1rne8lgs98p0jqe82sgt0qr4rdn4hgvmgp9ggcc"}' \
+localhost:9090 cosmos.staking.v1beta1.Query/UnbondingDelegation
+```
+
+示例输出：
+
+```bash
+{
+  "unbond": {
+    "delegator_address": "cosmos1y8nyfvmqh50p6ldpzljk3yrglppdv3t8phju77",
+    "validator_address": "cosmosvaloper1rne8lgs98p0jqe82sgt0qr4rdn4hgvmgp9ggcc",
+    "entries": [
+      {
+        "creation_height": "136984",
+        "completion_time": "2021-11-08T05:38:47.505593891Z",
+        "initial_balance": "400000000",
+        "balance": "400000000"
+      },
+      {
+        "creation_height": "137005",
+        "completion_time": "2021-11-08T05:40:53.526196312Z",
+        "initial_balance": "385000000",
+        "balance": "385000000"
+      }
+    ]
+  }
+}
+```
+
+#### DelegatorDelegations
+
+`DelegatorDelegations` 端点查询给定委托人地址的所有委托信息。
+
+```bash
+cosmos.staking.v1beta1.Query/DelegatorDelegations
+```
+
+示例：
+
+```bash
+grpcurl -plaintext \
+-d '{"delegator_addr": "cosmos1y8nyfvmqh50p6ldpzljk3yrglppdv3t8phju77"}' \
+localhost:9090 cosmos.staking.v1beta1.Query/DelegatorDelegations
+```
+
+示例输出：
+
+```bash
+{
+  "delegation_responses": [
+    {"delegation":{"delegator_address":"cosmos1y8nyfvmqh50p6ldpzljk3yrglppdv3t8phju77","validator_address":"cosmosvaloper1eh5mwu044gd5ntkkc2xgfg8247mgc56fww3vc8","shares":"25083339023.000000000000000000"},"balance":{"denom":"stake","amount":"25083339023"}}
+  ],
+  "pagination": {
+    "next_key": null,
+    "total": "1"
+  }
+}
+```
+
+#### DelegatorUnbondingDelegations
+
+`DelegatorUnbondingDelegations` 端点查询给定委托人地址的所有解绑委托信息。
+
+```bash
+cosmos.staking.v1beta1.Query/DelegatorUnbondingDelegations
+```
+
+示例：
+
+```bash
+grpcurl -plaintext \
+-d '{"delegator_addr": "cosmos1y8nyfvmqh50p6ldpzljk3yrglppdv3t8phju77"}' \
+localhost:9090 cosmos.staking.v1beta1.Query/DelegatorUnbondingDelegations
+```
+
+示例输出：
+
+```bash
+{
+  "unbonding_responses": [
+    {
+      "delegator_address": "cosmos1y8nyfvmqh50p6ldpzljk3yrglppdv3t8phju77",
+      "validator_address": "cosmosvaloper1sjllsnramtg3ewxqwwrwjxfgc4n4ef9uxyejze",
+      "entries": [
+        {
+          "creation_height": "136984",
+          "completion_time": "2021-11-08T05:38:47.505593891Z",
+          "initial_balance": "400000000",
+          "balance": "400000000"
+        },
+        {
+          "creation_height": "137005",
+          "completion_time": "2021-11-08T05:40:53.526196312Z",
+          "initial_balance": "385000000",
+          "balance": "385000000"
+        }
+      ]
+    }
+  ],
+  "pagination": {
+    "next_key": null,
+    "total": "1"
+  }
+}
+```
+
+#### Redelegations
+
+`Redelegations` 端点查询给定地址的重新委托信息。
+
+```bash
+cosmos.staking.v1beta1.Query/Redelegations
+```
+
+示例：
+
+```bash
+grpcurl -plaintext \
+-d '{"delegator_addr": "cosmos1ld5p7hn43yuh8ht28gm9pfjgj2fctujp2tgwvf", "src_validator_addr" : "cosmosvaloper1j7euyj85fv2jugejrktj540emh9353ltgppc3g", "dst_validator_addr" : "cosmosvaloper1yy3tnegzmkdcm7czzcy3flw5z0zyr9vkkxrfse"}' \
+localhost:9090 cosmos.staking.v1beta1.Query/Redelegations
+```
+
+示例输出：
+
+```bash
+{
+  "redelegation_responses": [
+    {
+      "redelegation": {
+        "delegator_address": "cosmos1ld5p7hn43yuh8ht28gm9pfjgj2fctujp2tgwvf",
+        "validator_src_address": "cosmosvaloper1j7euyj85fv2jugejrktj540emh9353ltgppc3g",
+        "validator_dst_address": "cosmosvaloper1yy3tnegzmkdcm7czzcy3flw5z0zyr9vkkxrfse",
+        "entries": null
+      },
+      "entries": [
+        {
+          "redelegation_entry": {
+            "creation_height": 135932,
+            "completion_time": "2021-11-08T03:52:55.299147901Z",
+            "initial_balance": "2900000",
+            "shares_dst": "2900000.000000000000000000"
+          },
+          "balance": "2900000"
+        }
+      ]
+    }
+  ],
+  "pagination": null
+}
+```
+
+#### DelegatorValidators
+
+`DelegatorValidators`端点查询给定委托人的所有验证人信息。
+
+```bash
+cosmos.staking.v1beta1.Query/DelegatorValidators
+```
+
+示例：
+
+```bash
+grpcurl -plaintext \
+-d '{"delegator_addr": "cosmos1ld5p7hn43yuh8ht28gm9pfjgj2fctujp2tgwvf"}' \
+localhost:9090 cosmos.staking.v1beta1.Query/DelegatorValidators
+```
+
+示例输出：
+
+```bash
+{
+  "validators": [
+    {
+      "operator_address": "cosmosvaloper1eh5mwu044gd5ntkkc2xgfg8247mgc56fww3vc8",
+      "consensus_pubkey": {
+        "@type": "/cosmos.crypto.ed25519.PubKey",
+        "key": "UPwHWxH1zHJWGOa/m6JB3f5YjHMvPQPkVbDqqi+U7Uw="
+      },
+      "jailed": false,
+      "status": "BOND_STATUS_BONDED",
+      "tokens": "347260647559",
+      "delegator_shares": "347260647559.000000000000000000",
+      "description": {
+        "moniker": "BouBouNode",
+        "identity": "",
+        "website": "https://boubounode.com",
+        "security_contact": "",
+        "details": "AI-based Validator. #1 AI Validator on Game of Stakes. Fairly priced. Don't trust (humans), verify. Made with BouBou love."
+      },
+      "unbonding_height": "0",
+      "unbonding_time": "1970-01-01T00:00:00Z",
+      "commission": {
+        "commission_rates": {
+          "rate": "0.061000000000000000",
+          "max_rate": "0.300000000000000000",
+          "max_change_rate": "0.150000000000000000"
+        },
+        "update_time": "2021-10-01T15:00:00Z"
+      },
+      "min_self_delegation": "1"
+    }
+  ],
+  "pagination": {
+    "next_key": null,
+    "total": "1"
+  }
+}
+```
+
+#### DelegatorValidator
+
+`DelegatorValidator`端点查询给定委托人验证人的信息。
+
+```bash
+cosmos.staking.v1beta1.Query/DelegatorValidator
+```
+
+示例：
+
+```bash
+grpcurl -plaintext \
+-d '{"delegator_addr": "cosmos1eh5mwu044gd5ntkkc2xgfg8247mgc56f3n8rr7", "validator_addr": "cosmosvaloper1eh5mwu044gd5ntkkc2xgfg8247mgc56fww3vc8"}' \
+localhost:9090 cosmos.staking.v1beta1.Query/DelegatorValidator
+```
+
+示例输出：
+
+```bash
+{
+  "validator": {
+    "operator_address": "cosmosvaloper1eh5mwu044gd5ntkkc2xgfg8247mgc56fww3vc8",
+    "consensus_pubkey": {
+      "@type": "/cosmos.crypto.ed25519.PubKey",
+      "key": "UPwHWxH1zHJWGOa/m6JB3f5YjHMvPQPkVbDqqi+U7Uw="
+    },
+    "jailed": false,
+    "status": "BOND_STATUS_BONDED",
+    "tokens": "347262754841",
+    "delegator_shares": "347262754841.000000000000000000",
+    "description": {
+      "moniker": "BouBouNode",
+      "identity": "",
+      "website": "https://boubounode.com",
+      "security_contact": "",
+      "details": "AI-based Validator. #1 AI Validator on Game of Stakes. Fairly priced. Don't trust (humans), verify. Made with BouBou love."
+    },
+    "unbonding_height": "0",
+    "unbonding_time": "1970-01-01T00:00:00Z",
+    "commission": {
+      "commission_rates": {
+        "rate": "0.061000000000000000",
+        "max_rate": "0.300000000000000000",
+        "max_change_rate": "0.150000000000000000"
+      },
+      "update_time": "2021-10-01T15:00:00Z"
+    },
+    "min_self_delegation": "1"
+  }
+}
+```
+
+#### HistoricalInfo
+
+```bash
+cosmos.staking.v1beta1.Query/HistoricalInfo
+```
+
+示例：
+
+```bash
+grpcurl -plaintext -d '{"height" : 1}' localhost:9090 cosmos.staking.v1beta1.Query/HistoricalInfo
+```
+
+示例输出：
+
+```bash
+{
+  "hist": {
+    "header": {
+      "version": {
+        "block": "11",
+        "app": "0"
+      },
+      "chain_id": "simd-1",
+      "height": "140142",
+      "time": "2021-10-11T10:56:29.720079569Z",
+      "last_block_id": {
+        "hash": "9gri/4LLJUBFqioQ3NzZIP9/7YHR9QqaM6B2aJNQA7o=",
+        "part_set_header": {
+          "total": 1,
+          "hash": "Hk1+C864uQkl9+I6Zn7IurBZBKUevqlVtU7VqaZl1tc="
+        }
+      },
+      "last_commit_hash": "VxrcS27GtvGruS3I9+AlpT7udxIT1F0OrRklrVFSSKc=",
+      "data_hash": "80BjOrqNYUOkTnmgWyz9AQ8n7SoEmPVi4QmAe8RbQBY=",
+      "validators_hash": "95W49n2hw8RWpr1GPTAO5MSPi6w6Wjr3JjjS7AjpBho=",
+      "next_validators_hash": "95W49n2hw8RWpr1GPTAO5MSPi6w6Wjr3JjjS7AjpBho=",
+      "consensus_hash": "BICRvH3cKD93v7+R1zxE2ljD34qcvIZ0Bdi389qtoi8=",
+      "app_hash": "ZZaxnSY3E6Ex5Bvkm+RigYCK82g8SSUL53NymPITeOE=",
+      "last_results_hash": "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+      "evidence_hash": "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+      "proposer_address": "aH6dO428B+ItuoqPq70efFHrSMY="
+    },
+  "valset": [
+      {
+        "operator_address": "cosmosvaloper196ax4vc0lwpxndu9dyhvca7jhxp70rmcqcnylw",
+        "consensus_pubkey": {
+          "@type": "/cosmos.crypto.ed25519.PubKey",
+          "key": "/O7BtNW0pafwfvomgR4ZnfldwPXiFfJs9mHg3gwfv5Q="
+        },
+        "jailed": false,
+        "status": "BOND_STATUS_BONDED",
+        "tokens": "1426045203613",
+        "delegator_shares": "1426045203613.000000000000000000",
+        "description": {
+          "moniker": "SG-1",
+          "identity": "48608633F99D1B60",
+          "website": "https://sg-1.online",
+          "security_contact": "",
+          "details": "SG-1 - your favorite validator on Witval. We offer 100% Soft Slash protection."
+        },
+        "unbonding_height": "0",
+        "unbonding_time": "1970-01-01T00:00:00Z",
+        "commission": {
+          "commission_rates": {
+            "rate": "0.037500000000000000",
+            "max_rate": "0.200000000000000000",
+            "max_change_rate": "0.030000000000000000"
+          },
+          "update_time": "2021-10-01T15:00:00Z"
+        },
+        "min_self_delegation": "1"
+      }
+    ]
+  }
+}
+
+```
+
+#### Pool
+
+`Pool`端点查询池的信息。
+
+```bash
+cosmos.staking.v1beta1.Query/Pool
+```
+
+示例：
+
+```bash
+grpcurl -plaintext -d localhost:9090 cosmos.staking.v1beta1.Query/Pool
+```
+
+示例输出：
+
+```bash
+{
+  "pool": {
+    "not_bonded_tokens": "369054400189",
+    "bonded_tokens": "15657192425623"
+  }
+}
+```
+
+#### Params
+
+`Params`端点查询池的信息。
+
+```bash
+cosmos.staking.v1beta1.Query/Params
+```
+
+示例：
+
+```bash
+grpcurl -plaintext localhost:9090 cosmos.staking.v1beta1.Query/Params
+```
+
+示例输出：
+
+```bash
+{
+  "params": {
+    "unbondingTime": "1814400s",
+    "maxValidators": 100,
+    "maxEntries": 7,
+    "historicalEntries": 10000,
+    "bondDenom": "stake"
+  }
+}
+```
+
+### REST
+
+用户可以使用REST端点查询`staking`模块。
+
+#### DelegatorDelegations
+
+`DelegatorDelegations` REST端点查询给定委托人地址的所有委托。
+
+```bash
+/cosmos/staking/v1beta1/delegations/{delegatorAddr}
+```
+
+示例：
+
+```bash
+curl -X GET "http://localhost:1317/cosmos/staking/v1beta1/delegations/cosmos1vcs68xf2tnqes5tg0khr0vyevm40ff6zdxatp5" -H  "accept: application/json"
+```
+
+示例输出：
+
+```bash
+{
+  "delegation_responses": [
+    {
+      "delegation": {
+        "delegator_address": "cosmos1vcs68xf2tnqes5tg0khr0vyevm40ff6zdxatp5",
+        "validator_address": "cosmosvaloper1quqxfrxkycr0uzt4yk0d57tcq3zk7srm7sm6r8",
+        "shares": "256250000.000000000000000000"
+      },
+      "balance": {
+        "denom": "stake",
+        "amount": "256250000"
+      }
+    },
+    {
+      "delegation": {
+        "delegator_address": "cosmos1vcs68xf2tnqes5tg0khr0vyevm40ff6zdxatp5",
+        "validator_address": "cosmosvaloper194v8uwee2fvs2s8fa5k7j03ktwc87h5ym39jfv",
+        "shares": "255150000.000000000000000000"
+      },
+      "balance": {
+        "denom": "stake",
+        "amount": "255150000"
+      }
+    }
+  ],
+  "pagination": {
+    "next_key": null,
+    "total": "2"
+  }
+}
+```
+
+#### Redelegations
+
+`Redelegations` REST端点查询给定地址的再委托。
+
+```bash
+/cosmos/staking/v1beta1/delegators/{delegatorAddr}/redelegations
+```
+
+示例：
+
+```bash
+curl -X GET \
+"http://localhost:1317/cosmos/staking/v1beta1/delegators/cosmos1thfntksw0d35n2tkr0k8v54fr8wxtxwxl2c56e/redelegations?srcValidatorAddr=cosmosvaloper1lzhlnpahvznwfv4jmay2tgaha5kmz5qx4cuznf&dstValidatorAddr=cosmosvaloper1vq8tw77kp8lvxq9u3c8eeln9zymn68rng8pgt4" \
+-H  "accept: application/json"
+```
+
+示例输出：
+
+```bash
+{
+  "redelegation_responses": [
+    {
+      "redelegation": {
+        "delegator_address": "cosmos1thfntksw0d35n2tkr0k8v54fr8wxtxwxl2c56e",
+        "validator_src_address": "cosmosvaloper1lzhlnpahvznwfv4jmay2tgaha5kmz5qx4cuznf",
+        "validator_dst_address": "cosmosvaloper1vq8tw77kp8lvxq9u3c8eeln9zymn68rng8pgt4",
+        "entries": null
+      },
+      "entries": [
+        {
+          "redelegation_entry": {
+            "creation_height": 151523,
+            "completion_time": "2021-11-09T06:03:25.640682116Z",
+            "initial_balance": "200000000",
+            "shares_dst": "200000000.000000000000000000"
+          },
+          "balance": "200000000"
+        }
+      ]
+    }
+  ],
+  "pagination": null
+}
+```
+
+#### DelegatorUnbondingDelegations
+
+`DelegatorUnbondingDelegations` REST端点查询给定委托人地址的所有解委托。
+
+```bash
+/cosmos/staking/v1beta1/delegators/{delegatorAddr}/unbonding_delegations
+```
+
+示例：
+
+```bash
+curl -X GET \
+"http://localhost:1317/cosmos/staking/v1beta1/delegators/cosmos1nxv42u3lv642q0fuzu2qmrku27zgut3n3z7lll/unbonding_delegations" \
+-H  "accept: application/json"
+```
+
+示例输出：
+
+```bash
+{
+  "unbonding_responses": [
+    {
+      "delegator_address": "cosmos1nxv42u3lv642q0fuzu2qmrku27zgut3n3z7lll",
+      "validator_address": "cosmosvaloper1e7mvqlz50ch6gw4yjfemsc069wfre4qwmw53kq",
+      "entries": [
+        {
+          "creation_height": "2442278",
+          "completion_time": "2021-10-12T10:59:03.797335857Z",
+          "initial_balance": "50000000000",
+          "balance": "50000000000"
+        }
+      ]
+    }
+  ],
+  "pagination": {
+    "next_key": null,
+    "total": "1"
+  }
+}
+```
+
+#### DelegatorValidators
+
+`DelegatorValidators` REST端点查询给定委托人地址的所有验证人信息。
+
+```bash
+/cosmos/staking/v1beta1/delegators/{delegatorAddr}/validators
+```
+
+示例：
+
+```bash
+curl -X GET \
+"http://localhost:1317/cosmos/staking/v1beta1/delegators/cosmos1xwazl8ftks4gn00y5x3c47auquc62ssune9ppv/validators" \
+-H  "accept: application/json"
+```
+
+示例输出：
+
+```bash
+{
+  "validators": [
+    {
+      "operator_address": "cosmosvaloper1xwazl8ftks4gn00y5x3c47auquc62ssuvynw64",
+      "consensus_pubkey": {
+        "@type": "/cosmos.crypto.ed25519.PubKey",
+        "key": "5v4n3px3PkfNnKflSgepDnsMQR1hiNXnqOC11Y72/PQ="
+      },
+      "jailed": false,
+      "status": "BOND_STATUS_BONDED",
+      "tokens": "21592843799",
+      "delegator_shares": "21592843799.000000000000000000",
+      "description": {
+        "moniker": "jabbey",
+        "identity": "",
+        "website": "https://twitter.com/JoeAbbey",
+        "security_contact": "",
+        "details": "just another dad in the cosmos"
+      },
+      "unbonding_height": "0",
+      "unbonding_time": "1970-01-01T00:00:00Z",
+      "commission": {
+        "commission_rates": {
+          "rate": "0.100000000000000000",
+          "max_rate": "0.200000000000000000",
+          "max_change_rate": "0.100000000000000000"
+        },
+        "update_time": "2021-10-09T19:03:54.984821705Z"
+      },
+      "min_self_delegation": "1"
+    }
+  ],
+  "pagination": {
+    "next_key": null,
+    "total": "1"
+  }
+}
+```
+
+#### DelegatorValidator
+
+`DelegatorValidator` REST端点查询给定委托人验证人对的验证人信息。
+
+```bash
+/cosmos/staking/v1beta1/delegators/{delegatorAddr}/validators/{validatorAddr}
+```
+
+示例：
+
+```bash
+curl -X GET \
+"http://localhost:1317/cosmos/staking/v1beta1/delegators/cosmos1xwazl8ftks4gn00y5x3c47auquc62ssune9ppv/validators/cosmosvaloper1xwazl8ftks4gn00y5x3c47auquc62ssuvynw64" \
+-H  "accept: application/json"
+```
+
+示例输出：
+
+```bash
+{
+  "validator": {
+    "operator_address": "cosmosvaloper1xwazl8ftks4gn00y5x3c47auquc62ssuvynw64",
+    "consensus_pubkey": {
+      "@type": "/cosmos.crypto.ed25519.PubKey",
+      "key": "5v4n3px3PkfNnKflSgepDnsMQR1hiNXnqOC11Y72/PQ="
+    },
+    "jailed": false,
+    "status": "BOND_STATUS_BONDED",
+    "tokens": "21592843799",
+    "delegator_shares": "21592843799.000000000000000000",
+    "description": {
+      "moniker": "jabbey",
+      "identity": "",
+      "website": "https://twitter.com/JoeAbbey",
+      "security_contact": "",
+      "details": "just another dad in the cosmos"
+    },
+    "unbonding_height": "0",
+    "unbonding_time": "1970-01-01T00:00:00Z",
+    "commission": {
+      "commission_rates": {
+        "rate": "0.100000000000000000",
+        "max_rate": "0.200000000000000000",
+        "max_change_rate": "0.100000000000000000"
+      },
+      "update_time": "2021-10-09T19:03:54.984821705Z"
+    },
+    "min_self_delegation": "1"
+  }
+}
+```
+
+#### HistoricalInfo
+
+`HistoricalInfo` REST端点查询给定高度的历史信息。
+
+```bash
+/cosmos/staking/v1beta1/historical_info/{height}
+```
+
+示例：
+
+```bash
+curl -X GET "http://localhost:1317/cosmos/staking/v1beta1/historical_info/153332" -H  "accept: application/json"
+```
+
+示例输出：
+
+```bash
+{
+  "hist": {
+    "header": {
+      "version": {
+        "block": "11",
+        "app": "0"
+      },
+      "chain_id": "cosmos-1",
+      "height": "153332",
+      "time": "2021-10-12T09:05:35.062230221Z",
+      "last_block_id": {
+        "hash": "NX8HevR5khb7H6NGKva+jVz7cyf0skF1CrcY9A0s+d8=",
+        "part_set_header": {
+          "total": 1,
+          "hash": "zLQ2FiKM5tooL3BInt+VVfgzjlBXfq0Hc8Iux/xrhdg="
+        }
+      },
+      "last_commit_hash": "P6IJrK8vSqU3dGEyRHnAFocoDGja0bn9euLuy09s350=",
+      "data_hash": "eUd+6acHWrNXYju8Js449RJ99lOYOs16KpqQl4SMrEM=",
+      "validators_hash": "mB4pravvMsJKgi+g8aYdSeNlt0kPjnRFyvtAQtaxcfw=",
+      "next_validators_hash": "mB4pravvMsJKgi+g8aYdSeNlt0kPjnRFyvtAQtaxcfw=",
+      "consensus_hash": "BICRvH3cKD93v7+R1zxE2ljD34qcvIZ0Bdi389qtoi8=",
+      "app_hash": "fuELArKRK+CptnZ8tu54h6xEleSWenHNmqC84W866fU=",
+      "last_results_hash": "p/BPexV4LxAzlVcPRvW+lomgXb6Yze8YLIQUo/4Kdgc=",
+      "evidence_hash": "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+      "proposer_address": "G0MeY8xQx7ooOsni8KE/3R/Ib3Q="
+    },
+    "valset": [
+      {
+        "operator_address": "cosmosvaloper196ax4vc0lwpxndu9dyhvca7jhxp70rmcqcnylw",
+        "consensus_pubkey": {
+          "@type": "/cosmos.crypto.ed25519.PubKey",
+          "key": "/O7BtNW0pafwfvomgR4ZnfldwPXiFfJs9mHg3gwfv5Q="
+        },
+        "jailed": false,
+        "status": "BOND_STATUS_BONDED",
+        "tokens": "1416521659632",
+        "delegator_shares": "1416521659632.000000000000000000",
+        "description": {
+          "moniker": "SG-1",
+          "identity": "48608633F99D1B60",
+          "website": "https://sg-1.online",
+          "security_contact": "",
+          "details": "SG-1 - your favorite validator on cosmos. We offer 100% Soft Slash protection."
+        },
+        "unbonding_height": "0",
+        "unbonding_time": "1970-01-01T00:00:00Z",
+        "commission": {
+          "commission_rates": {
+            "rate": "0.037500000000000000",
+            "max_rate": "0.200000000000000000",
+            "max_change_rate": "0.030000000000000000"
+          },
+          "update_time": "2021-10-01T15:00:00Z"
+        },
+        "min_self_delegation": "1"
+      },
+      {
+        "operator_address": "cosmosvaloper1t8ehvswxjfn3ejzkjtntcyrqwvmvuknzmvtaaa",
+        "consensus_pubkey": {
+          "@type": "/cosmos.crypto.ed25519.PubKey",
+          "key": "uExZyjNLtr2+FFIhNDAMcQ8+yTrqE7ygYTsI7khkA5Y="
+        },
+        "jailed": false,
+        "status": "BOND_STATUS_BONDED",
+        "tokens": "1348298958808",
+        "delegator_shares": "1348298958808.000000000000000000",
+        "description": {
+          "moniker": "Cosmostation",
+          "identity": "AE4C403A6E7AA1AC",
+          "website": "https://www.cosmostation.io",
+          "security_contact": "admin@stamper.network",
+          "details": "Cosmostation validator node. Delegate your tokens and Start Earning Staking Rewards"
+        },
+        "unbonding_height": "0",
+        "unbonding_time": "1970-01-01T00:00:00Z",
+        "commission": {
+          "commission_rates": {
+            "rate": "0.050000000000000000",
+            "max_rate": "1.000000000000000000",
+            "max_change_rate": "0.200000000000000000"
+          },
+          "update_time": "2021-10-01T15:06:38.821314287Z"
+        },
+        "min_self_delegation": "1"
+      }
+    ]
+  }
+}
+```
+
+#### Parameters
+
+`Parameters` REST端点查询质押参数。
+
+```bash
+/cosmos/staking/v1beta1/params
+```
+
+示例：
+
+```bash
+curl -X GET "http://localhost:1317/cosmos/staking/v1beta1/params" -H  "accept: application/json"
+```
+
+示例输出：
+
+```bash
+{
+  "params": {
+    "unbonding_time": "2419200s",
+    "max_validators": 100,
+    "max_entries": 7,
+    "historical_entries": 10000,
+    "bond_denom": "stake"
+  }
+}
+```
+
+#### Pool
+
+`Pool` REST端点查询池信息。
+
+```bash
+/cosmos/staking/v1beta1/pool
+```
+
+示例：
+
+```bash
+curl -X GET "http://localhost:1317/cosmos/staking/v1beta1/pool" -H  "accept: application/json"
+```
+
+示例输出：
+
+```bash
+{
+  "pool": {
+    "not_bonded_tokens": "432805737458",
+    "bonded_tokens": "15783637712645"
+  }
+}
+```
+
+#### Validators
+
+`Validators` REST端点查询与给定状态匹配的所有验证人。
+
+```bash
+/cosmos/staking/v1beta1/validators
+```
+
+示例：
+
+```bash
+curl -X GET "http://localhost:1317/cosmos/staking/v1beta1/validators" -H  "accept: application/json"
+```
+
+#### 验证器
+
+`Validator` REST端点查询给定验证器地址的验证器信息。
+
+```bash
+/cosmos/staking/v1beta1/validators/{validatorAddr}
+```
+
+示例：
+
+```bash
+curl -X GET \
+"http://localhost:1317/cosmos/staking/v1beta1/validators/cosmosvaloper16msryt3fqlxtvsy8u5ay7wv2p8mglfg9g70e3q" \
+-H  "accept: application/json"
+```
+
+#### 验证器委托
+
+`ValidatorDelegations` REST端点查询给定验证器的委托信息。
+
+```bash
+/cosmos/staking/v1beta1/validators/{validatorAddr}/delegations
+```
+
+示例：
+
+```bash
+curl -X GET "http://localhost:1317/cosmos/staking/v1beta1/validators/cosmosvaloper16msryt3fqlxtvsy8u5ay7wv2p8mglfg9g70e3q/delegations" -H  "accept: application/json"
+```
+
+#### 委托
+
+`Delegation` REST端点查询给定验证器和委托人地址的委托信息。
+
+```bash
+/cosmos/staking/v1beta1/validators/{validatorAddr}/delegations/{delegatorAddr}
+```
+
+示例：
+
+```bash
+curl -X GET \
+"http://localhost:1317/cosmos/staking/v1beta1/validators/cosmosvaloper16msryt3fqlxtvsy8u5ay7wv2p8mglfg9g70e3q/delegations/cosmos1n8f5fknsv2yt7a8u6nrx30zqy7lu9jfm0t5lq8" \
+-H  "accept: application/json"
+```
+
+#### 解绑委托
+
+`UnbondingDelegation` REST端点查询给定验证器和委托人地址的解绑委托信息。
+
+```bash
+/cosmos/staking/v1beta1/validators/{validatorAddr}/delegations/{delegatorAddr}/unbonding_delegation
+```
+
+示例：
+
+```bash
+curl -X GET \
+"http://localhost:1317/cosmos/staking/v1beta1/validators/cosmosvaloper13v4spsah85ps4vtrw07vzea37gq5la5gktlkeu/delegations/cosmos1ze2ye5u5k3qdlexvt2e0nn0508p04094ya0qpm/unbonding_delegation" \
+-H  "accept: application/json"
+```
+
+#### 验证器解绑委托
+
+`ValidatorUnbondingDelegations` REST端点查询给定验证器的解绑委托信息。
+
+```bash
+/cosmos/staking/v1beta1/validators/{validatorAddr}/unbonding_delegations
+```
+
+示例：
+
+```bash
+curl -X GET \
+"http://localhost:1317/cosmos/staking/v1beta1/validators/cosmosvaloper13v4spsah85ps4vtrw07vzea37gq5la5gktlkeu/unbonding_delegations" \
+-H  "accept: application/json"
+```
+
+
 
 
 # `x/staking`

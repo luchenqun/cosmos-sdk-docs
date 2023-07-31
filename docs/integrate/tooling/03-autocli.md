@@ -1,3 +1,159 @@
+# AutoCLI
+
+:::note 概述
+本文档详细介绍了如何为模块构建 CLI 和 REST 接口。其中包括了来自各种 Cosmos SDK 模块的示例。
+:::
+
+:::note
+
+## 先决条件阅读
+
+* [构建模块简介](../building-modules/00-intro.md)
+
+:::
+
+`autocli` 包是一个用于为基于 Cosmos SDK 的应用程序生成 CLI（命令行界面）接口的 [Go 库](https://pkg.go.dev/cosmossdk.io/client/v2/autocli)。它通过根据您的 gRPC 服务定义自动生成 CLI 命令，为您的应用程序提供了一种简单的方式来添加 CLI 命令。`autocli` 会直接从您的 protobuf 消息中生成 CLI 命令和标志，包括选项、输入参数和输出参数。这意味着您可以轻松地为您的应用程序添加 CLI 接口，而无需手动创建和管理命令。
+
+## 入门指南
+
+以下是使用 `autocli` 包的步骤：
+
+1. 定义实现 `appmodule.AppModule` 接口的应用程序模块。
+2. 通过在模块上实现 `func (am AppModule) AutoCLIOptions() *autocliv1.ModuleOptions` 方法，配置 `autocli` 命令生成的行为。了解更多信息，请参阅[此处](#高级用法)。
+3. 使用 `autocli.AppOptions` 结构指定您定义的模块。如果您使用 `depinject` 包来管理应用程序的依赖关系，它可以根据应用程序的配置自动创建 `autocli.AppOptions` 的实例。
+4. 使用 `autocli` 提供的 `EnhanceRootCommand()` 方法，将指定模块的 CLI 命令添加到您的根命令中。该方法还可以在 `client/v2/autocli/app.go` 文件中找到。此外，该方法还将 `autocli` 功能添加到您的应用程序的根命令中。该方法仅是增量的，这意味着如果已经为某个模块注册了命令，则不会创建命令。相反，它会将任何缺失的命令添加到根命令中。
+
+以下是如何使用 `autocli` 的示例：
+
+``` go
+// Define your app's modules
+testModules := map[string]appmodule.AppModule{
+    "testModule": &TestModule{},
+}
+
+// Define the autocli AppOptions
+autoCliOpts := autocli.AppOptions{
+    Modules: testModules,
+}
+
+// Get the root command
+rootCmd := &cobra.Command{
+    Use: "app",
+}
+
+// Enhance the root command with autocli
+autocli.EnhanceRootCommand(rootCmd, autoCliOpts)
+
+// Run the root command
+if err := rootCmd.Execute(); err != nil {
+    fmt.Println(err)
+}
+```
+
+## 标志
+
+`autocli` 为 protobuf 消息中的每个字段生成标志。默认情况下，标志的名称是根据消息中字段的名称生成的。您可以使用 `Builder.AddMessageFlags()` 方法的 `namingOptions` 参数自定义标志名称。
+
+定义消息的标志，您可以使用`Builder.AddMessageFlags()`方法。此方法接受`cobra.Command`实例和消息类型作为输入，并为消息中的每个字段生成标志。
+
+```go reference
+https://github.com/cosmos/cosmos-sdk/blob/1ac260cb1c6f05666f47e67f8b2cfd6229a55c3b/client/v2/autocli/common.go#L44-L49
+```
+
+`AddMessageFlags()`方法返回的`binder`变量用于将命令行参数绑定到消息中的字段。
+
+您还可以使用`Builder.AddMessageFlags()`方法的`namingOptions`参数自定义标志的行为。此参数允许您指定标志的自定义前缀，并指定是否为重复字段生成标志以及是否为具有默认值的字段生成标志。
+
+## 命令和查询
+
+`autocli`包为您的gRPC服务中定义的每个方法生成CLI命令和标志。默认情况下，它为不返回消息流的每个RPC方法生成命令。命令的名称基于服务方法的名称。
+
+例如，给定以下用于服务的protobuf定义：
+
+```protobuf
+service MyService {
+  rpc MyMethod(MyRequest) returns (MyResponse) {}
+}
+```
+
+`autocli`将为`MyMethod`方法生成一个名为`my-method`的命令。该命令将为`MyRequest`消息中的每个字段生成标志。
+
+如果您想自定义命令的行为，可以通过实现`autocli.Command`接口来定义自定义命令。然后，您可以将该命令注册到您的应用程序的`autocli.Builder`实例中。
+
+类似地，您可以通过实现`autocli.Query`接口来定义自定义查询。然后，您可以将该查询注册到您的应用程序的`autocli.Builder`实例中。
+
+要添加自定义命令或查询，可以使用`Builder.AddCustomCommand`或`Builder.AddCustomQuery`方法。这些方法分别接受`cobra.Command`或`cobra.Command`实例，可用于定义命令或查询的行为。
+
+## 高级用法
+
+### 指定子命令
+
+默认情况下，`autocli` 会为 gRPC 服务中的每个方法生成一个命令。但是，您可以指定子命令来将相关的命令分组在一起。要指定子命令，您可以使用 `autocliv1.ServiceCommandDescriptor` 结构体。
+
+以下示例展示了如何使用 `autocliv1.ServiceCommandDescriptor` 结构体来将相关的命令分组在一起，并在您的 gRPC 服务中指定子命令。您需要在 `autocli.go` 文件中定义 `autocliv1.ModuleOptions` 的实例。
+
+```go reference
+https://github.com/cosmos/cosmos-sdk/blob/bcdf81cbaf8d70c4e4fa763f51292d54aed689fd/x/gov/autocli.go#L9-L27
+```
+
+`autocli` 包中的 `AutoCLIOptions()` 方法允许您指定要映射到应用程序的服务和子命令。在示例代码中，`autocliv1.ModuleOptions` 结构体的实例被定义在 `x/gov/autocli.go` 文件中的 `appmodule.AppModule` 实现中。此配置将相关的命令分组在一起，并为每个服务指定了子命令。
+
+### 位置参数
+
+位置参数是在不被指定为标志的情况下传递给命令的参数。它们通常用于为命令提供附加的上下文，例如文件名或搜索查询。
+
+要向命令添加位置参数，您可以使用 `autocliv1.PositionalArgDescriptor` 结构体，如下面的示例所示。您需要指定 `ProtoField` 参数，该参数是应作为位置参数使用的 protobuf 字段的名称。此外，如果参数是可变长度参数，则可以将 `Varargs` 参数指定为 `true`。这只能应用于最后一个位置参数，并且 `ProtoField` 必须是一个重复字段。
+
+以下是如何为 `auth` 服务的 `Account` 方法定义位置参数的示例：
+
+```go reference
+https://github.com/cosmos/cosmos-sdk/blob/bcdf81cbaf8d70c4e4fa763f51292d54aed689fd/x/auth/autocli.go#L8-L32
+```
+
+以下是使用我们上面定义的位置参数的一些示例命令：
+
+查询账户地址：
+
+```bash
+<appd> query auth account cosmos1abcd...xyz
+```
+
+通过账户号码查询账户地址：
+
+```bash
+<appd> query auth address-by-acc-num 1
+```
+
+在这两个命令中，使用 `auth` 服务进行查询，使用 `query` 子命令，后跟调用的具体方法（`account` 或 `address-by-acc-num`）。位置参数包含在命令的末尾（`cosmos1abcd...xyz` 或 `1`），分别指定地址或账户号码。
+
+### 自定义标志名称
+
+默认情况下，`autocli` 根据您的 protobuf 消息中字段的名称生成标志名称。但是，您可以通过向 `Builder.AddMessageFlags()` 方法提供 `FlagOptions` 参数来自定义标志名称。该参数允许您根据消息字段的名称指定自定义标志的名称。例如，如果您有一个包含字段 `test` 和 `test1` 的消息，您可以使用以下命名选项来自定义标志
+
+``` go
+options := autocliv1.RpcCommandOptions{ 
+    FlagOptions: map[string]*autocliv1.FlagOptions{ 
+        "test": { Name: "custom_name", }, 
+        "test1": { Name: "other_name", }, 
+    }, 
+}
+
+builder.AddMessageFlags(message, options)
+```
+
+请注意，`autocliv1.RpcCommandOptions` 是 `autocliv1.ServiceCommandDescriptor` 结构体的一个字段，该结构体在 `autocliv1` 包中定义。要使用此选项，您可以在 `appmodule.AppModule` 实现中定义 `autocliv1.ModuleOptions` 的实例，并为相关的服务命令描述符指定 `FlagOptions`。
+
+## 结论
+
+`autocli` 是一个强大的工具，可为基于 Cosmos SDK 的应用程序添加 CLI 接口。它允许您轻松地从 protobuf 消息生成 CLI 命令和标志，并提供许多选项来自定义 CLI 应用程序的行为。
+
+要进一步提升基于 Cosmos SDK 的区块链的 CLI 体验，您可以使用 `Hubl`。`Hubl` 是一个工具，允许您使用 Cosmos SDK 的新 AutoCLI 功能查询任何基于 Cosmos SDK 的区块链。使用 hubl，您可以轻松配置一个新的链，并仅使用几个简单的命令查询模块。
+
+有关 `Hubl` 的更多信息，包括如何配置新链和查询模块，请参阅 [Hubl 文档](https://docs.cosmos.network/main/tooling/hubl)。
+
+Please paste the Markdown content here.
+
+
 
 
 
