@@ -1,3 +1,226 @@
+# 轻客户端攻击者隔离
+
+对于轻客户端而言，对于 Tendermint 区块链的状态，攻击性节点可能有动机进行虚假陈述。试图这样做被称为攻击。轻客户端 [验证][verification] 通过检查所谓的“提交”来检查传入数据，提交是一组（假设）在执行 Tendermint 共识期间产生的已签名消息。因此，攻击归结为创建和签署与 Tendermint 共识算法规则不符的 Tendermint 共识消息。
+
+由于在每个区块中，Tendermint 共识和轻客户端验证在假设超过 2/3 的正确投票权力的情况下是安全的[[TMBC-FM-2THIRDS]][TMBC-FM-2THIRDS-link]，这意味着如果存在攻击，则违反了[[TMBC-FM-2THIRDS]][TMBC-FM-2THIRDS-link]，也就是说，存在这样一个区块：
+
+- 验证者偏离了协议，并且
+- 这些验证者在该区块中代表了超过 1/3 的投票权力。
+
+在[攻击][node-based-attack-characterization]的情况下，轻客户端[攻击检测机制][detection]计算数据，即所谓的证据[[LC-DATA-EVIDENCE.1]][LC-DATA-EVIDENCE-link]，可以用于
+
+- 证明已经发生了攻击[[TMBC-LC-EVIDENCE-DATA.1]][TMBC-LC-EVIDENCE-DATA-link]，以及
+- 作为找到偏离 Tendermint 协议的实际节点的基础。
+
+本规范考虑了 Tendermint 区块链中的完整节点如何隔离发起攻击的一组攻击者。该集合应满足以下条件：
+
+- 该集合不包含正确的验证者
+- 该集合包含代表仍处于解绑期的区块的超过 1/3 的投票权力的验证者
+
+# 大纲
+
+在提供了[问题陈述](#第一部分-基础和问题定义)之后，我们指定了[隔离函数](#第二部分-协议)，并以对 Tendermint 共识的计算机辅助分析为基础讨论了其[正确性](#第三部分-完整性)。
+
+# 第一部分 - 基础和问题定义
+
+对于此处使用的数据结构的定义，特别是LightBlocks [[LCV-DATA-LIGHTBLOCK.1]](https://github.com/tendermint/spec/blob/master/rust-spec/lightclient/verification/verification_002_draft.md#lcv-data-lightblock1)，我们参考了[轻客户端验证][verification]的规范。
+
+[检测机制][detection]的规范描述了以下内容：
+
+- 什么是轻客户端攻击，
+- 检测器在何种条件下会检测到轻客户端攻击，
+- 以及在检测到攻击时的输出数据格式，称为证据。该格式在[[LC-DATA-EVIDENCE.1]][LC-DATA-EVIDENCE-link]中定义，如下所示：
+
+```go
+type LightClientAttackEvidence struct {
+    ConflictingBlock   LightBlock
+    CommonHeight       int64
+}
+```
+
+隔离器是一个函数，它以证据`ev`和区块链的前缀`bc`作为输入，至少要达到高度`ev.ConflictingBlock.Header.Height + 1`。输出是一组验证者的*peerIDs*。
+
+我们假设全节点与区块链同步，并且已经达到高度`ev.ConflictingBlock.Header.Height + 1`。
+
+#### **[LCAI-INV-Output.1]**
+
+当生成输出时，满足以下属性：
+
+- 如果
+    - `bc[CommonHeight].bfttime`在全节点的解绑定期内，
+    - `ev.ConflictingBlock.Header != bc[ev.ConflictingBlock.Header.Height]`
+    - `ev.ConflictingBlock.Commit`中的验证者在`bc[ev.CommonHeight].NextValidators`中代表超过1/3的投票权
+- 那么：输出是`bc[CommonHeight].NextValidators`中的一组验证者，这些验证者
+    - 在`bc[ev.commonHeight].NextValidators`中代表超过1/3的投票权
+    - 通过违反Tendermint共识协议为高度`ev.ConflictingBlock.Header.Height`签署了Tendermint共识消息。
+- 否则：为空集。
+
+# 第二部分 - 协议
+
+在这里，我们讨论如何解决隔离恶意进程的问题。我们描述了函数`isolateMisbehavingProcesses`以及下面的所有辅助函数。在[第三部分](#part-III---Completeness)中，我们将根据使用自动化工具进行分析的结果讨论解决方案的完整性。
+
+## 隔离
+
+### 大纲
+
+我们首先检查是否可以从共同高度验证冲突块。然后，我们首先检查是否是疯狂攻击（违反有效性）。如果不是这种情况，我们检查是否存在不一致。如果也不是这种情况，我们开始进行链上[问责协议](https://docs.google.com/document/d/11ZhMsCj3y7zIZz4udO9l25xqb0kl7gmWqNpGVRzOeyY/edit)。
+
+#### **[LCAI-FUNC-MAIN.1]**
+
+```go
+func isolateMisbehavingProcesses(ev LightClientAttackEvidence, bc Blockchain) []ValidatorAddress {
+
+    reference := bc[ev.conflictingBlock.Header.Height].Header
+    ev_header := ev.conflictingBlock.Header
+
+    ref_commit := bc[ev.conflictingBlock.Header.Height + 1].Header.LastCommit // + 1 !!
+    ev_commit := ev.conflictingBlock.Commit
+
+    if violatesTMValidity(reference, ev_header) {
+        // lunatic light client attack
+        signatories := Signers(ev.ConflictingBlock.Commit)
+        bonded_vals := Addresses(bc[ev.CommonHeight].NextValidators)
+        return intersection(signatories,bonded_vals)
+
+    }
+    // If this point is reached the validator sets in reference and ev_header are identical
+    else if RoundOf(ref_commit) == RoundOf(ev_commit) {
+        // equivocation light client attack
+        return intersection(Signers(ref_commit), Signers(ev_commit))
+    }
+    else {
+        // amnesia light client attack
+        return IsolateAmnesiaAttacker(ev, bc)
+    }
+}
+```
+
+- 实现注释
+    - 如果全节点只达到高度`ev.conflictingBlock.Header.Height`，那么`bc[ev.conflictingBlock.Header.Height + 1].Header.LastCommit`指的是该高度的本地存储的提交。（根据`length(bc)`的前提条件，此提交必须存在。）
+    - 我们在前提条件中检查解绑期是否已过期。然而，由于时间的推移，在将验证器交给Cosmos SDK之前，需要再次检查时间，以满足仅报告已绑定的验证器的合约要求。将验证器传递给SDK超出了本规范的范围。
+- 预期前提条件
+    - `length(bc) >= ev.conflictingBlock.Header.Height`
+    - `ValidAndVerifiedUnbonding(bc[ev.CommonHeight], ev.ConflictingBlock) == SUCCESS`
+    - `ev.ConflictingBlock.Header != bc[ev.ConflictingBlock.Header.Height]`
+    - `ev.conflictingBlock`满足基本验证（特别是Commit中的所有签名消息来自同一轮）
+- 预期后置条件
+    - [[FN-INV-Output.1]](#FN-INV-Output1)成立
+- 错误条件
+    - 如果违反前提条件，则返回错误。
+
+### 函数细节
+
+#### **[LCAI-FUNC-VVU.1]**
+
+```go
+func ValidAndVerifiedUnbonding(trusted LightBlock, untrusted LightBlock) Result
+```
+
+- 条件与[[LCV-FUNC-VALID.2]][LCV-FUNC-VALID.link]相同，只是将前提条件“*trusted.Header.Time > now - trustingPeriod*”替换为
+    - `trusted.Header.Time > now - UnbondingPeriod`
+
+#### **[LCAI-FUNC-NONVALID.1]**
+
+```go
+func violatesTMValidity(ref Header, ev Header) boolean
+```
+
+- 实现备注
+    - 通过与参考头进行比较，检查证据头`ev`是否违反了Tendermint共识的有效性属性
+- 预期前提条件
+    - `ref.Height == ev.Height`
+- 预期后置条件
+    - 返回以下析取式的评估结果  
+    **[LCAI-NONVALID-OUTPUT.1]** ==  
+    `ref.ValidatorsHash != ev.ValidatorsHash` 或者  
+    `ref.NextValidatorsHash != ev.NextValidatorsHash` 或者  
+    `ref.ConsensusHash != ev.ConsensusHash` 或者  
+    `ref.AppHash != ev.AppHash` 或者  
+    `ref.LastResultsHash != ev.LastResultsHash`
+
+```go
+func IsolateAmnesiaAttacker(ev LightClientAttackEvidence, bc Blockchain) []ValidatorAddress
+```
+
+- 实现备注
+    - 这会触发[查询/响应协议](https://docs.google.com/document/d/11ZhMsCj3y7zIZz4udO9l25xqb0kl7gmWqNpGVRzOeyY/edit)。
+- 预期后置条件
+    - 根据[LCAI-INV-Output.1]返回攻击者。
+
+```go
+func RoundOf(commit Commit) []ValidatorAddress
+```
+
+- 预期前提条件
+    - `commit`是格式良好的。特别是所有投票都来自同一轮`r`。
+- 预期后置条件
+    - 返回在commit的所有投票中编码的轮次`r`
+- 错误条件
+    - 如果违反了前提条件，则报告错误
+
+```go
+func Signers(commit Commit) []ValidatorAddress
+```
+
+- 预期后置条件
+    - 返回`commit`中的所有验证者地址
+
+```go
+func Addresses(vals Validator[]) ValidatorAddress[]
+```
+
+- 预期后置条件
+    - 返回`vals`中的所有验证者地址
+
+# 第三部分 - 完整性
+
+正如本文档开头所讨论的，攻击归结为根据Tendermint共识算法规则创建和签署共识消息。
+主要函数`isolateMisbehavingProcesses`区分了三种错误签名的消息，即，
+
+- 疯狂的：签署无效的区块
+- 矛盾：在同一共识轮次中双重签署有效的区块
+- 遗忘：在不同的共识轮次中签署冲突的区块，而没有看到足够的消息来允许这样做。
+
+问题是是否捕捉到了所有攻击。
+首先观察`isolateMisbehavingProcesses`中的第一个检查是`violatesTMValidity`。它处理了疯狂攻击。如果这个检查通过，也就是`violatesTMValidity`返回`FALSE`，这意味着[[LCAI-NONVALID-OUTPUT.1]](#LCAI-FUNC-NONVALID1])的结果为false，这意味着`ref.ValidatorsHash = ev.ValidatorsHash`。因此，在`violatesTMValidity`之后，所有涉及的验证者都是来自区块链的验证者。因此，分析具有固定成员组（验证者集合）的Tendermint共识的一个实例就足够了。此外，由于同一高度有两个不同的区块，只需要考虑两个不同的有效共识值，即二进制共识。
+
+对于这个固定的成员组，我们使用[Tendermint Consensus in TLA+][tendermint-accountability]的TLA+规范分析了攻击。我们检查了确实只有可能导致协议违反的情况是**equivocation**和**amnesia**。Galois对基于[Ivy proofs](https://github.com/tendermint/spec/tree/master/ivy-proofs)的协议进行的独立研究得出了相同的结论。
+
+# 参考资料
+
+[[supervisor]] 轻客户端监督者的规范。
+
+[[verification]] 轻客户端验证协议的规范。
+
+[[detection]] 轻客户端攻击检测机制的规范。
+
+[[tendermint-accountability]]: 用于检查攻击类型的TLA+规范
+
+[tendermint-accountability]:
+https://github.com/tendermint/spec/blob/master/rust-spec/tendermint-accountability/README.md
+
+[supervisor]:
+https://github.com/tendermint/spec/blob/master/rust-spec/lightclient/supervisor/supervisor_001_draft.md
+
+[verification]: https://github.com/tendermint/spec/blob/master/rust-spec/lightclient/verification/verification_002_draft.md
+
+[detection]:
+https://github.com/tendermint/spec/blob/master/rust-spec/lightclient/detection/detection_003_reviewed.md
+
+[LC-DATA-EVIDENCE-link]:
+https://github.com/tendermint/spec/blob/master/rust-spec/lightclient/detection/detection_003_reviewed.md#lc-data-evidence1
+
+[TMBC-LC-EVIDENCE-DATA-link]:
+https://github.com/tendermint/spec/blob/master/rust-spec/lightclient/detection/detection_003_reviewed.md#tmbc-lc-evidence-data1
+
+[node-based-attack-characterization]:
+https://github.com/tendermint/spec/blob/master/rust-spec/lightclient/detection/detection_003_reviewed.md#node-based-characterization-of-attacks
+
+[TMBC-FM-2THIRDS-link]: https://github.com/tendermint/spec/blob/master/rust-spec/lightclient/verification/verification_002_draft.md#tmbc-fm-2thirds1
+
+[LCV-FUNC-VALID.link]: https://github.com/tendermint/spec/blob/master/rust-spec/lightclient/verification/verification_002_draft.md#lcv-func-valid2
+
+
 # Lightclient Attackers Isolation
 
 Adversarial nodes may have the incentive to lie to a lightclient about the state of a Tendermint blockchain. An attempt to do so is called attack. Light client [verification][verification] checks incoming data by checking a so-called "commit", which is a forwarded set of signed messages that is (supposedly) produced during executing Tendermint consensus. Thus, an attack boils down to creating and signing Tendermint consensus messages in deviation from the Tendermint consensus algorithm rules.

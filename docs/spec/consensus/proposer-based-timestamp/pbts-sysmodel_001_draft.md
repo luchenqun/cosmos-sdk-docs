@@ -1,3 +1,195 @@
+# 基于提议者的时间 - 第一部分
+
+## 系统模型
+
+### 时间和时钟
+
+#### **[PBTS-CLOCK-NEWTON.0]**
+
+存在一个参考的牛顿实时时间 `t`（UTC）。
+
+每个正确的验证者 `V` 维护一个同步的时钟 `C_V`，确保：
+
+#### **[PBTS-CLOCK-PRECISION.0]**
+
+存在一个系统参数 `PRECISION`，对于任意两个正确的验证者 `V` 和 `W`，以及任意实时时间 `t`，  
+`|C_V(t) - C_W(t)| < PRECISION`
+
+
+### 消息延迟
+
+我们不希望干扰 Tendermint 的时间假设。我们将假设一个时间限制，如果满足，则保证了活性。
+
+通常情况下，本地时钟可能会与全局时间有偏差。（它可能会快进，例如，一秒钟的时钟时间可能需要 1.005 秒的实时时间）。因此，本地时钟和全局时钟可能以不同的时间单位进行测量。通常，消息延迟是以全局时钟时间单位来衡量的。为了精确估计正确的本地超时时间，我们需要估计消息延迟的时钟时间持续时间，考虑到时钟漂移。为了简单起见，我们忽略了这一点，并直接假设消息延迟的假设是以本地时间为基础的。
+
+#### **[PBTS-MSG-D.0]**
+
+存在一个系统参数 `MSGDELAY`，用于以时钟时间计算的消息端到端延迟。
+
+> 注意，[PBTS-MSG-D.0] 对消息延迟以及时钟施加了约束。
+
+#### **[PBTS-MSG-FAIR.0]**
+
+正确的提议者和正确的验证者之间（对于 `PROPOSE` 消息）的消息端到端延迟小于 `MSGDELAY`。
+
+
+## 问题陈述
+
+在本节中，我们在这个新的系统模型中定义 Tendermint 共识的属性（参见 [arXiv 论文][arXiv]）。
+
+#### **[PBTS-PROPOSE.0]**
+
+提议者提出一个共识值 `v` 和时间 `t` 的对 `(v,t)`。
+
+> 然后，我们对允许的决策进行以下限制：
+
+#### **[PBTS-INV-AGREEMENT.0]**
+
+[一致性] 没有两个正确的验证者对不同的值 `v` 做出决策。
+
+#### **[PBTS-INV-TIME-VAL.0]**
+
+[时间有效性] 如果一个正确的验证者对 `t` 做出决策，则 `t` 是“OK”的（我们将在下面形式化这一点），即使最多有 `2f` 个验证者是有故障的。
+
+然而，对于Tendermint共识的属性，更加关注的是区块，即写入区块的内容和时间。因此，在接下来的内容中，我们将从这个以区块为中心的视角给出安全性和活性属性。
+为此，请注意，在共识高度`k`决定的时间`t`将写入高度为`k+1`的区块，并且将由相同共识轮`r`的`2f + 1`个`PRECOMMIT`消息支持。我们将在区块中表示写入的时间为`b.time`（以区别于基于中位数的时间术语`bfttime`）。为此，具有以下共识算法属性非常重要：
+
+#### **[PBTS-INV-TIME-AGR.0]**
+
+[时间一致性] 如果两个正确的验证者在同一轮决策，则它们对于相同的`t`达成一致。
+
+#### **[PBTS-DECISION-ROUND.0]**
+
+请注意，共识决策与区块之间的关系并不直接；特别是在考虑时间时：在提议的解决方案中，由于验证者可能在不同的轮次决策，它们可能在不同的时间上做出决策。
+下一个区块的提议者可能选择一个提交（至少来自一轮的`2f + 1`个`PRECOMMIT`消息），从而选择一个将成为“规范”的决策轮次。
+因此，提议者隐式地可以选择属于验证者决策轮次的时间之一。请注意，这个选择在基于中位数的`bfttime`中已经隐含存在。
+然而，由于大多数共识实例在Cosmos Hub上在一个轮次内终止，这在实践中几乎不会被观察到。
+
+最后，请注意，一致性（[一致性]和[时间一致性]）属性是基于Tendermint安全模型[TMBC-FM-2THIRDS.0]中超过2/3个正确验证者的基础上的，而[时间有效性]是基于超过1/3个正确验证者的。
+
+### 安全性
+
+在这里，我们将提供将本地时间与区块时间相关联的规范。然而，由于我们目前不假设本地时间与实时时间相关联，因此这些规范也不提供区块时间与实时时间之间的关系。这样的属性将在[后面](#REAL-TIME-SAFETY)给出。
+
+对于一个正确的验证者 `V`，让 `beginConsensus(V,k)` 表示其将高度设置为 `k` 时的本地时间，`endConsensus(V,k)` 表示其将高度设置为 `k + 1` 时的时间。
+
+定义
+
+- `beginConsensus(k)` 为 `beginConsensus(V,k)` 的最小值，
+- `last-beginConsensus(k)` 为 `beginConsensus(V,k)` 的最大值，
+- `endConsensus(k)` 为 `endConsensus(V,k)` 的最大值，
+
+其中 `V` 为所有正确的验证者。
+
+> 注意到 `beginConsensus(k) <= last-beginConsensus(k)`，如果本地时钟是单调的，则有 `last-beginConsensus(k) <= endConsensus(k)`。
+
+#### **[PBTS-CLOCK-GROW.0]**
+
+我们假设在一个共识实例中，本地时钟不会被回拨，特别地，对于每个正确的验证者 `V` 和每个高度 `k`，我们有 `beginConsensus(V,k) < endConsensus(V,k)`。
+
+#### **[PBTS-CONSENSUS-TIME-VALID.0]**
+
+如果
+
+- 存在一个高度为 `k` 的有效提交 `c`，且
+- `c` 包含至少一个正确的验证者的 `PRECOMMIT` 消息，
+
+那么由 `c` 签名的块 `b` 中的时间 `b.time` 满足
+
+- `beginConsensus(k) - PRECISION <= b.time < endConsensus(k) + PRECISION + MSGDELAY`。
+
+> [PBTS-CONSENSUS-TIME-VALID.0] 基于一个分析，其中提议者是有错误的（不计入 `beginConsensus(k)` 和 `endConsensus(k)`），我们估计正确的验证者接收和 `accept` `propose` 消息的时间。如果提议者是正确的，我们得到
+
+#### **[PBTS-CONSENSUS-LIVE-VALID-CORR-PROP.0]**
+
+如果第一轮的提议者是正确的，并且满足
+
+- 对于高度为 `k - 1` 的块，[TMBC-FM-2THIRDS.0] 成立，
+- [PBTS-MSG-FAIR.0]，
+- [PBTS-CLOCK-PRECISION.0]，
+- [PBTS-CLOCK-GROW.0]（**TODO:** 是否足够？），
+
+那么最终（在有界时间内），每个正确的验证者都会在第一轮中做出决策。
+
+#### **[PBTS-CONSENSUS-SAFE-VALID-CORR-PROP.0]**
+
+如果第一轮的提议者是正确的，并且满足
+
+- 对于高度为 `k - 1` 的块，[TMBC-FM-2THIRDS.0] 成立，
+- [PBTS-MSG-FAIR.0]，
+- [PBTS-CLOCK-PRECISION.0]，
+- [PBTS-CLOCK-GROW.0]（**TODO:** 是否足够？），
+
+那么有 `beginConsensus_k <= b.time <= last-beginConsensus_k`。
+
+> 对于上述两个属性，我们假设一个正确的提议者 `v` 在其本地时间 `beginConsensus(v,k)` 发送其 `PROPOSAL`。
+
+### 存活性
+
+如果满足以下条件：
+
+- 对于高度为 `k - 1` 的区块，[TMBC-FM-2THIRDS.0] 成立，并且
+- [PBTS-MSG-FAIR.0]，
+- [PBTS-CLOCK.0]，以及
+- [PBTS-CLOCK-GROW.0]（**TODO:** 这样够了吗？）
+
+那么最终会存在一个高度为 `k` 的有效提交 `c`。
+
+
+### 实时安全性
+
+> 我们希望给出一个可以从外部利用的属性，也就是说，给定一个带有一些时间的区块，我们可以估计该区块生成的实时时间。为此，我们需要将时钟时间与实时时间关联起来；而这在 [PBTS-CLOCK.0] 中并不成立。因此，我们引入以下关于时钟的假设：
+
+#### **[PBTS-CLOCKSYNC-EXTERNAL.0]**
+
+存在一个系统参数 `ACCURACY`，对于所有实时时间 `t` 和所有正确的验证者 `V`，满足：
+
+- `| C_V(t) - t | < ACCURACY`。
+
+> `ACCURACY` 不一定在代码层面可见。下面的属性只是展示了，它的值越小，区块时间越接近实时时间。
+
+#### **[PBTS-CONSENSUS-PTIME.0]**
+
+设 `m` 是一个提议消息。我们考虑以下两个实时时间 `proposalTime(m)` 和 `propRecvTime(m)`：
+
+- 如果提议者是正确的，并在时间 `t` 发送了 `m`，我们用实时时间 `t` 表示 `proposalTime(m)`。
+- 如果第一个正确的验证者在时间 `t` 接收了 `m`，我们用实时时间 `t` 表示 `propRecvTime(m)`。
+
+
+#### **[PBTS-CONSENSUS-REALTIME-VALID.0]**
+
+设 `b` 是一个包含至少一个正确验证者的 `precommit` 消息的有效提交的区块（且 `proposalTime` 是触发 `precommit` 的高度/轮次 `propose` 消息 `m` 的时间）。那么：
+
+`propRecvTime(m) - ACCURACY - PRECISION < b.time < propRecvTime(m) + ACCURACY + PRECISION + MSGDELAY`
+
+
+#### **[PBTS-CONSENSUS-REALTIME-VALID-CORR.0]**
+
+设 `b` 是一个包含至少一个正确验证者的 `precommit` 消息的有效提交的区块（且 `proposalTime` 是触发 `precommit` 的高度/轮次 `propose` 消息 `m` 的时间）。那么，如果提议者是正确的：
+
+`proposalTime(m) - ACCURACY < b.time < proposalTime(m) + ACCURACY`
+
+> 在时间 `proposalTime(m)` 算法中，提议者修正了 `m.time <- now_p(proposalTime(m))`
+
+> "触发了 `PRECOMMIT`" 意味着 `m` 和 `b` 中的数据是"匹配的"，也就是说，`m` 提议的值实际上存储在 `b` 中。
+
+返回[主文档][main]。
+
+[main]: ./pbts_001_draft.md
+
+[arXiv]: https://arxiv.org/abs/1807.04938
+
+[tlatender]: https://github.com/tendermint/spec/blob/master/rust-spec/tendermint-accountability/README.md
+
+[bfttime]: https://github.com/tendermint/spec/blob/439a5bcacb5ef6ef1118566d7b0cd68fff3553d4/spec/consensus/bft-time.md
+
+[lcspec]: https://github.com/tendermint/spec/blob/439a5bcacb5ef6ef1118566d7b0cd68fff3553d4/rust-spec/lightclient/README.md
+
+[algorithm]: ./pbts-algorithm_001_draft.md
+
+[sysmodel]: ./pbts-sysmodel_001_draft.md
+
+
 # Proposer-Based Time - Part I
 
 ## System Model

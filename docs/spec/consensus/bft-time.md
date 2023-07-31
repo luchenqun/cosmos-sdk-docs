@@ -1,3 +1,41 @@
+# BFT 时间
+
+Tendermint 提供了一种确定性的拜占庭容错时间源。Tendermint 中的时间是通过区块头的 Time 字段来定义的。
+
+它满足以下属性：
+
+- 时间单调性：时间是单调递增的，即给定高度为 h1 的区块头 H1 和高度为 `h2 = h1 + 1` 的区块头 H2，有 `H1.Time < H2.Time`。
+- 时间有效性：给定形成 `block.LastCommit` 字段的一组 Commit 投票，区块头的 Time 字段的有效值范围仅由正确进程发送的 Precommit 消息（来自 LastCommit 字段）定义，即有缺陷的进程不能任意增加 Time 值。
+
+在 Tendermint 的上下文中，时间的类型是 int64，表示以毫秒为单位的 UNIX 时间，即自1970年1月1日以来的毫秒数。在定义需要由 Tendermint 共识协议强制执行的规则之前，以便满足上述属性，我们引入以下定义：
+
+- Commit 的中位数等于 Vote 消息的 Vote.Time 字段的中位数，其中 Vote.Time 的值按照进程的投票权重计数。在 Tendermint 中，投票权重不均匀（一个进程一票），一个投票消息实际上是相同投票的聚合器，其数量等于投票该投票消息的进程的投票权重。
+
+让我们考虑以下示例：
+
+- 我们有四个进程 p1、p2、p3 和 p4，其投票权重分别为 (p1, 23)、(p2, 27)、(p3, 10) 和 (p4, 10)。总投票权重为 70（`N = 3f+1`，其中 `N` 是总投票权重，`f` 是有缺陷进程的最大投票权重），因此我们假设有缺陷的进程最多具有 23 的投票权重。
+此外，我们在某个 LastCommit 字段中有以下投票消息（我们忽略除 Time 字段之外的所有字段）：
+    - (p1, 100)、(p2, 98)、(p3, 1000)、(p4, 500)。我们假设 p3 和 p4 是有缺陷的进程。假设 `block.LastCommit` 消息包含了进程 p2、p3 和 p4 的投票。中位数的选择方式如下：
+    值 98 被计数了 27 次，值 1000 被计数了 10 次，值 500 也被计数了 10 次。因此，中位数的值将是 98。无论我们选择哪个具有至少 `2f+1` 投票权重的消息集合，中位数的值始终在正确进程发送的值之间。
+
+我们通过以下规则确保时间单调性和时间有效性属性：
+
+- 让 rs 表示某个进程的 `RoundState`（共识内部状态）。那么
+`rs.ProposalBlock.Header.Time == median(rs.LastCommit) &&
+rs.Proposal.Timestamp == rs.ProposalBlock.Header.Time`。
+
+- 此外，在创建 `vote` 消息时，应满足以下规则以确定 `vote.Time` 字段：
+
+    - 如果 `rs.LockedBlock` 已定义，则
+    `vote.Time = max(rs.LockedBlock.Timestamp + time.Millisecond, time.Now())`，其中 `time.Now()`
+        表示本地 Unix 时间（以毫秒为单位）
+
+    - 否则，如果 `rs.Proposal` 已定义，则
+    `vote.Time = max(rs.Proposal.Timestamp + time.Millisecond, time.Now())`，
+
+    - 否则，`vote.Time = time.Now())`。在这种情况下，投票是针对 `nil` 的，因此不会被考虑在下一个区块的时间戳中。
+
+
 ---
 order: 2
 ---

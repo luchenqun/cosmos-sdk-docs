@@ -1,6 +1,29 @@
 ---
 order: 1
 parent:
+  title: Tendermint质量保证
+  description: 这是一个关于在测试网络上运行v0.34.x时所遵循的流程和获得的结果的报告
+  order: 2
+---
+
+# Tendermint质量保证
+
+该目录记录了Tendermint核心团队在发布之前进行质量保证时所遵循的流程。
+该目录将存在于多个分支中。在每个发布分支上，
+该目录的内容反映了在应用质量保证流程时的状态
+该发布的时间。
+
+文件[method](./method.md)记录了获得结果所遵循的流程
+用于决定一个发布是否通过了质量保证流程。
+每个发布中获得的结果都存储在自己的目录中。
+以下发布已经经历了质量保证流程：
+
+* [v0.34.x](./v034/)，在发布v0.34.22之前进行了测试
+
+
+---
+order: 1
+parent:
   title: Tendermint Quality Assurance
   description: This is a report on the process followed and results obtained when running v0.34.x on testnets
   order: 2

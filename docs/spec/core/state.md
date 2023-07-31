@@ -1,3 +1,103 @@
+# 状态
+
+状态包含的信息的密码摘要包含在区块头中，因此对于验证新区块是必要的。例如，验证器集合和交易结果从不包含在区块中，但它们的 Merkle 根是包含在区块中的：状态跟踪它们。
+
+`State` 对象本身是一个实现细节，因为它从不包含在区块中或通过网络传播，并且我们从不计算它的哈希。`State` 对象的持久性或查询接口是一个实现细节，不包含在规范中。然而，`State` 对象中的类型是规范的一部分，因为 `State` 对象的 Merkle 根包含在区块中，并且在验证过程中使用值。
+
+```go
+type State struct {
+    ChainID        string
+    InitialHeight  int64
+
+    LastBlockHeight int64
+    LastBlockID     types.BlockID
+    LastBlockTime   time.Time
+
+    Version     Version
+    LastResults []Result
+    AppHash     []byte
+
+    LastValidators ValidatorSet
+    Validators     ValidatorSet
+    NextValidators ValidatorSet
+
+    ConsensusParams ConsensusParams
+}
+```
+
+链 ID 和初始高度来自创世文件，并且不再更改。在典型情况下，初始高度将为 `1`，`0` 是一个无效值。
+
+请注意，有一个硬编码的限制为 10000 个验证器。这是从提交中的投票数量限制继承而来。
+
+有关 [`Validator`](./data_structures.md#validator)、[`ValidatorSet`](./data_structures.md#validatorset) 和 [`ConsensusParams`](./data_structures.md#consensusparams) 的更多信息可以在 [数据结构](./data_structures.md) 中找到。
+
+## 执行
+
+在执行一个区块的末尾，状态会得到更新。特别感兴趣的是 `ResponseEndBlock` 和 `ResponseCommit`
+
+```go
+type ResponseEndBlock struct {
+	ValidatorUpdates      []ValidatorUpdate       `protobuf:"bytes,1,rep,name=validator_updates,json=validatorUpdates,proto3" json:"validator_updates"`
+	ConsensusParamUpdates *types1.ConsensusParams `protobuf:"bytes,2,opt,name=consensus_param_updates,json=consensusParamUpdates,proto3" json:"consensus_param_updates,omitempty"`
+	Events                []Event                 `protobuf:"bytes,3,rep,name=events,proto3" json:"events,omitempty"`
+}
+```
+
+其中
+
+```go
+type ValidatorUpdate struct {
+	PubKey crypto.PublicKey `protobuf:"bytes,1,opt,name=pub_key,json=pubKey,proto3" json:"pub_key"`
+	Power  int64            `protobuf:"varint,2,opt,name=power,proto3" json:"power,omitempty"`
+}
+```
+
+和
+
+```go
+type ResponseCommit struct {
+	// reserve 1
+	Data         []byte `protobuf:"bytes,2,opt,name=data,proto3" json:"data,omitempty"`
+	RetainHeight int64  `protobuf:"varint,3,opt,name=retain_height,json=retainHeight,proto3" json:"retain_height,omitempty"`
+}
+```
+
+`ValidatorUpdates` 用于向当前集合添加和删除验证器，以及更新验证器的权重。在 `ValidatorUpdate` 中将验证器的权重设置为 0 将导致该验证器被移除。`ConsensusParams` 被安全地复制（即，如果字段为 nil，则被忽略），并且 `ResponseCommit` 中的 `Data` 被用作 `AppHash`。
+
+## 版本
+
+```go
+type Version struct {
+  consensus Consensus
+  software string
+}
+```
+
+[`Consensus`](./data_structures.md#version) 包含区块链和应用程序的协议版本。
+
+## 区块
+
+一个区块的总大小由 `ConsensusParams.Block.MaxBytes` 以字节为单位进行限制。
+建议的区块大小必须小于此大小，否则将被视为无效。
+
+区块还应该受到区块中交易所消耗的 "gas" 数量的限制，尽管这尚未实现。
+
+## 证据
+
+为了使区块中的证据有效，必须满足以下条件：
+
+```go
+block.Header.Time-evidence.Time < ConsensusParams.Evidence.MaxAgeDuration &&
+ block.Header.Height-evidence.Height < ConsensusParams.Evidence.MaxAgeNumBlocks
+```
+
+一个区块中的证据数量不能超过 `ConsensusParams.Evidence.MaxBytes`。这是为了减轻垃圾邮件攻击而实施的。
+
+## 验证者
+
+创世文件和 `ResponseEndBlock` 中的验证者必须具有类型 ∈ `ConsensusParams.Validator.PubKeyTypes` 的公钥。
+
+
 # State
 
 The state contains information whose cryptographic digest is included in block headers, and thus is

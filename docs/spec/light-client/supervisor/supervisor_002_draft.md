@@ -1,3 +1,112 @@
+# 轻客户端主管草案，供讨论
+
+## 初始化的修改
+
+轻客户端使用LCInitData进行初始化
+
+### **[LC-DATA-INIT.2]**
+
+```go
+type LCInitData struct {
+    TrustedBlock   LightBlock
+    Genesis        GenesisDoc
+    TrustedHash    []byte
+    TrustedHeight  int64
+}
+```
+
+其中只需要提供其中一个组件。`GenesisDoc`在[Tendermint
+Types](https://github.com/tendermint/tendermint/blob/v0.34.x/types/genesis.go)中定义。
+
+### 初始化
+
+轻客户端基于主观初始化。它必须信任用户提供的初始数据。它目前无法检测攻击，因此需要一个初始的信任点。有三种形式的初始数据用于获取第一个可信任的区块：
+
+- 从先前的初始化中获取的可信任区块
+- 可信任的高度和哈希
+- 创世文件
+
+Golang轻客户端实现按照这个顺序检查初始数据；首先尝试从可信任存储中找到可信任区块，然后获取主节点上可信任高度和匹配哈希的轻区块，最后检查创世文件以验证初始头部。
+
+轻客户端无需检查可信任区块是否在可信任期内，因为它已经信任它，但是如果轻区块超出了可信任期，轻客户端将无法验证任何内容的可能性更高。
+
+在初始化时与提供者交叉检查这个可信任区块有助于确保节点响应并正确配置，但并不增加信任，因为证明一个冲突的区块是一个[轻客户端攻击](https://github.com/tendermint/tendermint/blob/v0.34.x/spec/light-client/detection/detection_003_reviewed.md#tmbc-lc-attack1)，而不仅仅是一个[虚假的](https://github.com/tendermint/tendermint/blob/v0.34.x/spec/light-client/detection/detection_003_reviewed.md#tmbc-bogus1)区块可能导致在可信任期之外执行向后验证，因此是徒劳的努力。
+
+然而，考虑到宁愿早失败也不愿晚失败的观点，Golang轻客户端实现将对所有提供者执行一致性检查，如果其中一个返回不同的头部，则会报错，让用户有机会重新初始化。
+
+#### **[LC-FUNC-INIT.2]:**
+
+```go
+func InitLightClient(initData LCInitData) (LightStore, Error) {
+    var initialBlock LightBlock
+
+    switch {
+    case LCInitData.TrustedBlock != nil:
+        // we trust the block from a prior initialization
+        initialBlock = LCInitData.TrustedBlock
+
+    case LCInitData.TrustedHash != nil:
+        untrustedBlock := FetchLightBlock(PeerList.Primary(), LCInitData.TrustedHeight)
+        
+
+        // verify that the hashes match
+        if untrustedBlock.Hash() != LCInitData.TrustedHash {
+            return nil, Error("Primary returned block with different hash")
+        }
+        // after checking the hash we now trust the block
+        initialBlock = untrustedBlock        
+    }
+    case LCInitData.Genesis != nil:
+        untrustedBlock := FetchLightBlock(PeerList.Primary(), LCInitData.Genesis.InitialHeight)
+        
+        // verify that 2/3+ of the validator set signed the untrustedBlock
+        if err := VerifyCommitFull(untrustedBlock.Commit, LCInitData.Genesis.Validators); err != nil {
+            return nil, err
+        }
+
+        // we can now trust the block
+        initialBlock = untrustedBlock
+    default:
+        return nil, Error("No initial data was provided")
+
+    // This is done in the golang version but is optional and not strictly part of the protocol
+    if err := CrossCheck(initialBlock, PeerList.Witnesses()); err != nil {
+        return nil, err
+    }
+
+    // initialize light store
+    lightStore := new LightStore;
+    lightStore.Add(newBlock);
+    return (lightStore, OK);
+}
+
+func CrossCheck(lb LightBlock, witnesses []Provider) error {
+    for _, witness := range witnesses {
+        witnessBlock := FetchLightBlock(witness, lb.Height)
+
+        if witnessBlock.Hash() != lb.Hash() {
+            return Error("Witness has different block")
+        }
+    }
+    return OK
+}
+
+```
+
+- 实现备注
+    - 无
+- 预期前置条件
+    - *LCInitData* 包含创世文件或轻区块
+    - 如果是创世文件，需要通过 `ValidateAndComplete()` 进行验证和补全，参见 [Tendermint](https://informal.systems)
+- 预期后置条件
+    - *lightStore* 使用可信的轻区块进行初始化。它可能已经通过交叉检查（来自创世文件）或者用户的初始信任进行了验证。
+- 错误条件
+    - 如果前置条件被违反
+    - peerList 为空
+
+----
+
+
 # Draft of Light Client Supervisor for discussion
 
 ## Modification to the initialization

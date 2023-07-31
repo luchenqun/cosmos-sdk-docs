@@ -1,3 +1,35 @@
+# Ivy证明
+
+```copyright
+版权所有 (c) 2020 Galois, Inc.
+SPDX许可证标识符：Apache-2.0
+```
+
+## 目录
+
+此文件夹包含以下内容：
+
+* `tendermint.ivy`，Tendermint算法的规范，如E. Buchman、J. Kwon、Z. Milosevic在《关于BFT共识的最新八卦》中所述。
+* `abstract_tendermint.ivy`，更抽象的Tendermint规范，更适合验证。
+* `classic_safety.ivy`，证明Tendermint满足BFT共识的经典安全性属性：如果每两个法定人数都有一个行为良好的节点共同存在，则没有两个行为良好的节点会发生分歧。
+* `accountable_safety_1.ivy`，证明在假设每个法定人数至少包含一个行为良好的节点的情况下，如果两个行为良好的节点发生分歧，则存在证据表明至少f+1个节点行为不端。
+* `accountable_safety_2.ivy`，证明无论对法定人数做出任何假设，行为良好的节点都无法被恶意节点陷害。换句话说，恶意节点永远无法构造指控行为良好节点的证据。
+* `network_shim.ivy`，网络模型和一个方便的`shim`对象，用于与Tendermint规范进行交互。
+* `domain_model.ivy`，Tendermint规范的基础领域模型的规范，即轮次、值、法定人数等。
+
+所有规范和证明都是用[Ivy](https://github.com/kenmcmil/ivy)编写的。
+
+上述许可证适用于此文件夹中的所有文件。
+
+## 构建和运行
+
+检查证明的最简单方法是使用[Docker](https://www.docker.com/)。
+
+1. 安装[Docker](https://docs.docker.com/get-docker/)和[Docker Compose](https://docs.docker.com/compose/install/)。
+2. 构建Docker镜像：`docker-compose build`
+3. 在Docker容器中运行证明：`docker-compose run tendermint-proof`。这将使用`ivy_check`命令检查所有证明，并将`ivy_check`的输出写入`./output/`的子目录中。
+
+
 # Ivy Proofs
 
 ```copyright
